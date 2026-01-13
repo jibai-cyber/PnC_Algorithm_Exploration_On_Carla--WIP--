@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'simple_ctrl = vehicle_ctrl.simple_ctrl:main',
+            'vehicle_plotter = vehicle_ctrl.vehicle_plotter:main',
             'odom_rect_marker = vehicle_ctrl.odom_rect_marker:main',
             'remap_goal = vehicle_ctrl.remap_goal:main',
         ],
