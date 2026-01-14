@@ -19,6 +19,7 @@ from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float64MultiArray
 from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus, CarlaEgoVehicleInfo
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from tf_transformations import euler_from_quaternion
 import math
 import numpy as np
@@ -78,7 +79,8 @@ class StanleyController:
         
         return interpolated_kappa
 
-    def compute_steering(self, current_x, current_y, current_yaw, current_v, path, dt=0.05, wheelbase=2.8, path_curvatures=None):
+    # FIXME: 第二段转弯处加完噪声会存在严重震荡
+    def compute_steering(self, current_x, current_y, current_yaw, current_v, path, dt=0.05, wheelbase=2.8, path_curvatures=None, start_idx=0):
         """
         计算转向角（复用前视点线段信息，优化曲率插值）
         
@@ -103,9 +105,10 @@ class StanleyController:
         nearest_seg_unitvec = None
 
 
-        max_idx = min(len(path) - 1, 10)
         # TODO: 优化查找最近路径段
-        for i in range(0,max_idx):
+        min_search_idx = max(0, start_idx - 50)
+        max_search_idx = min(len(path)-1, start_idx + 50)
+        for i in range(min_search_idx, max_search_idx):
             start_point = np.array(path[i])
             end_point = np.array(path[i + 1])
             
@@ -158,7 +161,7 @@ class StanleyController:
         steering_angle = np.clip(steer_correction, -self.max_steer, self.max_steer)
         
         
-        return 0.0, (float(lookahead_point[0]), float(lookahead_point[1])), cross_track_error, curvature, nearest_idx
+        return steering_angle, (float(lookahead_point[0]), float(lookahead_point[1])), cross_track_error, curvature, nearest_idx
 
 
 class PIDController:
@@ -231,7 +234,7 @@ class CarlaVehicleControl(Node):
         
         # 初始化PID速度控制器
         self.speed_controller = PIDController(
-            kp=2.0, ki=0.15, kd=0.0, 
+            kp=2.0, ki=0.15, kd=0.05, 
             dt=self.control_dt,
             output_limits=(-2.0, 2.0),
             integral_limit=1.0
@@ -239,7 +242,7 @@ class CarlaVehicleControl(Node):
         
         # 加速度内环（输出油门/刹车）
         self.throttle_controller = PIDController(
-            kp=0.105, ki=0.04, kd=0.0, 
+            kp=0.15, ki=0.04, kd=0.0, 
             dt=self.control_dt,
             output_limits=(0.0, 1.0),  # 输出范围是油门/刹车（特别需要注意的是0.3为油门死区，1=全油门）
             integral_limit=10.0
@@ -284,12 +287,18 @@ class CarlaVehicleControl(Node):
         self.filter_alpha_spd = 0.1
         self.filter_alpha_throttle = 0.1
         self.filter_alpha_brake = 0.6
+        self.filter_alpha_x = 0.3  # 位置x滤波系数
+        self.filter_alpha_y = 0.3  # 位置y滤波系数
+        self.filter_alpha_yaw = 0.3  # 姿态yaw滤波系数
 
         # 滤波后的实际值
         self.filtered_actual_acc = 0.0  # 滤波后的纵向加速度
         self.filtered_actual_spd = 0.0  # 滤波后的速度
         self.filtered_actual_throttle = 0.3  # 滤波后的油门
         self.filtered_actual_brake = 0.0  # 滤波后的刹车
+        self.filtered_actual_x = 0.0  # 滤波后的位置x
+        self.filtered_actual_y = 0.0  # 滤波后的位置y
+        self.filtered_actual_yaw = 0.0  # 滤波后的姿态yaw
 
         # 油门刹车切换相关参数
         self.prev_throttle = 0.3
@@ -297,6 +306,14 @@ class CarlaVehicleControl(Node):
         
         # 路径曲率
         self.path_curvatures = []
+        
+        # 高斯噪声参数（标准差）
+        self.enable_noise = True  # 噪声开关标志位，True=启用噪声，False=禁用噪声
+        self.odom_noise_std_x = 0.025  # 位置x方向噪声标准差 (m)
+        self.odom_noise_std_y = 0.01 # 位置y方向噪声标准差 (m)
+        self.odom_noise_std_yaw = 0.01  # 姿态yaw噪声标准差 (rad)
+        self.status_noise_std_velocity = 0.1  # 速度噪声标准差 (m/s)
+        self.imu_noise_std_accel = 0.05  # 加速度噪声标准差 (m/s²)
         
         # 线程锁
         self.data_lock = threading.Lock()
@@ -348,7 +365,7 @@ class CarlaVehicleControl(Node):
             CarlaEgoVehicleInfo,
             '/carla/ego_vehicle/vehicle_info',
             self.vehicle_info_callback,
-            10
+            QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         )
         self.imu_sub = self.create_subscription(
             Imu,
@@ -470,12 +487,25 @@ class CarlaVehicleControl(Node):
         
         # 验证移动是否成功
         new_loc = self.ego_vehicle.get_location()
+        new_transform = self.ego_vehicle.get_transform()
+        new_yaw = new_transform.rotation.yaw/360.0*2*math.pi
+
+        # 更新滤波器初始位置
+        self.filtered_actual_x = new_loc.x
+        self.filtered_actual_y = new_loc.y
+        self.filtered_actual_yaw = new_yaw
         self.get_logger().info(f"移动后位置: ({new_loc.x:.2f}, {new_loc.y:.2f}, {new_loc.z:.2f})")
+        self.get_logger().info(f"移动后航向角: {new_yaw:.2f}°")
         self.get_logger().info(f"{GREEN}✓ 车辆已移动到中心线: ({x:.2f}, {y:.2f}){RESET}")
     
     def status_callback(self, msg):
-        """车辆状态回调 - 获取速度"""
-        self.vehicle_speed = msg.velocity  # m/s
+        """车辆状态回调"""
+        raw_velocity = msg.velocity  # m/s
+        if self.enable_noise:
+            noise_velocity = np.random.normal(0.0, self.status_noise_std_velocity)
+            self.vehicle_speed = raw_velocity + noise_velocity
+        else:
+            self.vehicle_speed = raw_velocity
         self.filtered_actual_spd = self.filter_alpha_spd * self.vehicle_speed + (1 - self.filter_alpha_spd) * self.filtered_actual_spd
         self.vehicle_speed = self.filtered_actual_spd
 
@@ -488,7 +518,12 @@ class CarlaVehicleControl(Node):
         """IMU回调 - 获取纵向加速度"""
         # IMU消息中，linear_acceleration.x 是纵向加速度（车辆前进方向）
         # CARLA坐标系：x轴向前，y轴向左，z轴向上
-        longitudinal_accel = msg.linear_acceleration.x  # m/s²
+        raw_longitudinal_accel = msg.linear_acceleration.x  # m/s²
+        if self.enable_noise:
+            noise_accel = np.random.normal(0.0, self.imu_noise_std_accel)
+            longitudinal_accel = raw_longitudinal_accel + noise_accel
+        else:
+            longitudinal_accel = raw_longitudinal_accel
         self.filtered_actual_acc = self.filter_alpha_acc * longitudinal_accel + (1 - self.filter_alpha_acc) * self.filtered_actual_acc
         self.vehicle_accel = self.filtered_actual_acc
     
@@ -584,14 +619,35 @@ class CarlaVehicleControl(Node):
     def odometry_callback(self, msg):
         """里程计回调"""
         with self.data_lock:
-            self.vehicle_x = msg.pose.pose.position.x
-            self.vehicle_y = msg.pose.pose.position.y
+            raw_x = msg.pose.pose.position.x
+            raw_y = msg.pose.pose.position.y
+            if self.enable_noise:
+                noise_x = np.random.normal(0.0, self.odom_noise_std_x)
+                noise_y = np.random.normal(0.0, self.odom_noise_std_y)
+                self.vehicle_x = raw_x + noise_x
+                self.vehicle_y = raw_y + noise_y
+            else:
+                self.vehicle_x = raw_x
+                self.vehicle_y = raw_y
+            
+            # FIXME:改用卡尔曼滤波
+            # self.filtered_actual_x = self.filter_alpha_x * self.vehicle_x + (1 - self.filter_alpha_x) * self.filtered_actual_x
+            # self.filtered_actual_y = self.filter_alpha_y * self.vehicle_y + (1 - self.filter_alpha_y) * self.filtered_actual_y
+            # self.vehicle_x = self.filtered_actual_x
+            # self.vehicle_y = self.filtered_actual_y
             
             orientation_q = msg.pose.pose.orientation
             _, _, yaw = euler_from_quaternion(
                 [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
             )
-            self.vehicle_yaw = yaw
+            if self.enable_noise:
+                noise_yaw = np.random.normal(0.0, self.odom_noise_std_yaw)
+                self.vehicle_yaw = yaw + noise_yaw
+            else:
+                self.vehicle_yaw = yaw
+            
+            # self.filtered_actual_yaw = self.filter_alpha_yaw * self.vehicle_yaw + (1 - self.filter_alpha_yaw) * self.filtered_actual_yaw
+            # self.vehicle_yaw = self.filtered_actual_yaw
     
     # FIXME: 采样点过于密集，当前间距0.1m
     def downsample_path(self, path, interval=1.0):
@@ -627,7 +683,7 @@ class CarlaVehicleControl(Node):
             new_waypoints.append((x, y))
         
         # 路径降采样（间隔1米）
-        new_waypoints = self.downsample_path(new_waypoints, interval=1.0)
+        new_waypoints = self.downsample_path(new_waypoints, interval=0.5)
         
         with self.data_lock:
             self.waypoints = new_waypoints
@@ -784,13 +840,13 @@ class CarlaVehicleControl(Node):
         # planned_speed = np.clip(planned_speed, self.min_speed, self.max_speed)
 
         # FIXME: 临时测试，后期删除
-        if self.log_counter / 20 > 15 and self.log_counter / 20 < 35:
-            planned_speed = 7
-        elif self.log_counter / 20 > 35:
-            planned_speed = 2
-        else:
-            planned_speed = 3.5
-        # planned_speed = 5
+        # if self.log_counter / 20 > 15 and self.log_counter / 20 < 35:
+        #     planned_speed = 7
+        # elif self.log_counter / 20 > 35:
+        #     planned_speed = 2
+        # else:
+        #     planned_speed = 3.5
+        planned_speed = 5
         
         # 接近终点减速
         if len(self.waypoints) > 0:
@@ -837,7 +893,6 @@ class CarlaVehicleControl(Node):
     def control_loop(self):
         """控制循环"""
         st_time = time.time()
-        print(f"start: {st_time}")
         try:
             with self.data_lock:
                 if not self.waypoints:
@@ -867,16 +922,13 @@ class CarlaVehicleControl(Node):
                             self.control_timer.cancel()
                     return
             
-            # 转换路径格式
-            path_points = [(wp[0], wp[1]) for wp in waypoints[current_waypoint_index:]]
-            
-            
             # 使用Stanley控制器计算转向角
             steering_angle, target_point, cross_track_error, curvature, nearest_idx = self.stanley.compute_steering(
-                current_x, current_y, current_yaw, current_v, path_points, self.control_dt, self.vehicle_wheelbase, self.path_curvatures
+                current_x, current_y, current_yaw, current_v, waypoints, self.control_dt, self.vehicle_wheelbase, self.path_curvatures, current_waypoint_index
             )
 
             self.current_waypoint_index = nearest_idx
+            print(f"current_waypoint_index: {current_waypoint_index}, nearest_idx: {nearest_idx}")
             
             # 速度规划
             planned_speed = self.plan_speed()
@@ -944,11 +996,6 @@ class CarlaVehicleControl(Node):
             self.get_logger().error(f"控制循环错误: {e}")
             import traceback
             self.get_logger().error(traceback.format_exc())
-        finally:
-            end_time = time.time()
-            print(f"end: {end_time}")
-            print(f"time: {end_time - st_time}")
-            print("--------------------------------")
     
     def start_control(self):
         """开始控制（适配Humble Timer，避免重复创建）"""
