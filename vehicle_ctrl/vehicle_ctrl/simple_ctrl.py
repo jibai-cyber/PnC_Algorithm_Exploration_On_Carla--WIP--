@@ -215,7 +215,7 @@ class BicycleModelEKF:
     用于车辆位置和航向角跟踪
     """
 
-    def __init__(self, x0, P0, Q, R, l=2.8, dt=0.1):
+    def __init__(self, x0, P0, Q, R, l=2.8, dt=0.1, control_dt=0.05):
         self.x_hat = np.array(x0, dtype=float)  # 状态估计 [x, y, phi]
         self.P = np.array(P0, dtype=float)      # 估计协方差
         self.x_pred = None                      # 预测状态
@@ -228,6 +228,7 @@ class BicycleModelEKF:
         # 车辆参数
         self.l = float(l)                       # 轴距
         self.dt = float(dt)                     # 采样时间
+        self.is_updating = False
 
     def normalize_angle(self, angle):
         normalized = angle
@@ -360,11 +361,17 @@ class CarlaVehicleControl(Node):
         
         
         # 状态变量
-        self.vehicle_x = 0.0
-        self.vehicle_y = 0.0
-        self.vehicle_yaw = 0.0
-        self.vehicle_speed = 0.0  # m/s
-        self.vehicle_accel = 0.0
+        self.measured_x = 0.0
+        self.measured_y = 0.0
+        self.measured_yaw = 0.0
+        self.measured_speed = 0.0  # m/s
+        self.measured_accel = 0.0
+
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_yaw = 0.0
+        self.current_speed = 0.0
+        self.current_steer = 0.0    #control_loop更新后才可使用，当前模型假设转向角控制无误差
         
         self.waypoints = []
         self.current_waypoint_index = 0
@@ -374,6 +381,7 @@ class CarlaVehicleControl(Node):
         self.wait_for_goal = True
         
         self.is_controlling = False
+        self.is_spd_updated = False
         self.control_timer: Timer | None = None
 
         # 滤波系数
@@ -601,16 +609,12 @@ class CarlaVehicleControl(Node):
         raw_velocity = msg.velocity  # m/s
         if self.enable_noise:
             noise_velocity = np.random.normal(0.0, self.status_noise_std_velocity)
-            self.vehicle_speed = raw_velocity + noise_velocity
+            self.measured_speed = raw_velocity + noise_velocity
         else:
-            self.vehicle_speed = raw_velocity
-        self.filtered_actual_spd = self.filter_alpha_spd * self.vehicle_speed + (1 - self.filter_alpha_spd) * self.filtered_actual_spd
-        self.vehicle_speed = self.filtered_actual_spd
-
-        # 纵向加速度现在从IMU话题获取，不再从此处获取
-        # self.vehicle_accel = math.sqrt(msg.acceleration.linear.x**2 + msg.acceleration.linear.y**2) # 纵向加速度
-        # self.filtered_actual_acc = self.filter_alpha_acc * self.vehicle_accel + (1 - self.filter_alpha_acc) * self.filtered_actual_acc
-        # self.vehicle_accel = self.filtered_actual_acc
+            self.measured_speed = raw_velocity
+        self.filtered_actual_spd = self.filter_alpha_spd * self.measured_speed + (1 - self.filter_alpha_spd) * self.filtered_actual_spd
+        self.measured_speed = self.filtered_actual_spd
+        self.is_spd_updated = True
     
     def imu_callback(self, msg):
         """IMU回调 - 获取纵向加速度"""
@@ -623,7 +627,7 @@ class CarlaVehicleControl(Node):
         else:
             longitudinal_accel = raw_longitudinal_accel
         self.filtered_actual_acc = self.filter_alpha_acc * longitudinal_accel + (1 - self.filter_alpha_acc) * self.filtered_actual_acc
-        self.vehicle_accel = self.filtered_actual_acc
+        self.measured_accel = self.filtered_actual_acc
     
     def vehicle_info_callback(self, msg):
         """车辆信息回调 - 获取轴距、最大转向角、车轮等信息"""
@@ -722,7 +726,8 @@ class CarlaVehicleControl(Node):
             Q=self.ekf_Q,
             R=self.ekf_R,
             l=self.vehicle_wheelbase,
-            dt=self.ekf_dt
+            dt=self.ekf_dt,
+            control_dt=self.control_dt
         )
         self.get_logger().info(f"EKF已初始化: 初始状态 {self.ekf_x0}")
 
@@ -753,9 +758,9 @@ class CarlaVehicleControl(Node):
             # 初始化EKF（如果还未初始化）
             if self.ekf is None:
                 self.initialize_ekf(measured_x, measured_y, measured_yaw)
-                self.vehicle_x = measured_x
-                self.vehicle_y = measured_y
-                self.vehicle_yaw = measured_yaw
+                self.measured_x = measured_x
+                self.measured_y = measured_y
+                self.measured_yaw = measured_yaw
                 return
 
             # 准备观测值 [x, y, phi]
@@ -763,12 +768,17 @@ class CarlaVehicleControl(Node):
 
             # 执行EKF步骤 (预测 + 更新)
             # 使用上一次的控制输入进行预测
+            self.ekf.is_updating = True
             x_est = self.ekf.step(self.last_control_input, z)
 
             # 更新车辆状态
-            self.vehicle_x = x_est[0]
-            self.vehicle_y = x_est[1]
-            self.vehicle_yaw = x_est[2]
+            # self.measured_x = x_est[0]
+            # self.measured_y = x_est[1]
+            # self.measured_yaw = x_est[2]
+            self.current_x = x_est[0]
+            self.current_y = x_est[1]
+            self.current_yaw = x_est[2]
+            self.ekf.is_updating = False
     
     # FIXME: 采样点过于密集，当前间距0.1m
     def downsample_path(self, path, interval=1.0):
@@ -809,27 +819,12 @@ class CarlaVehicleControl(Node):
         with self.data_lock:
             self.waypoints = new_waypoints
             
-            # # 找到最近的路径点作为起始索引
-            # if len(new_waypoints) > 0:
-            #     min_dist = float('inf')
-            #     closest_idx = 0
-            #     for i, wp in enumerate(new_waypoints):
-            #         dist = math.sqrt((self.vehicle_x - wp[0])**2 + (self.vehicle_y - wp[1])**2)
-            #         if dist < min_dist:
-            #             min_dist = dist
-            #             closest_idx = i
-            #     self.current_waypoint_index = closest_idx
-            # else:
             self.current_waypoint_index = 0
             
             # 计算路径曲率
             self.path_curvatures = self.compute_curvatures(new_waypoints)
         
         self.get_logger().info(f"{CYAN}✓ 收到路径规划，包含 {len(new_waypoints)} 个路径点{RESET}")
-        
-        # 如果已经设置了目标点，开始控制
-        if not self.wait_for_goal and not self.is_controlling:
-            self.start_control()
     
     def initialpose_callback(self, msg):
         """初始位置回调"""
@@ -926,13 +921,13 @@ class CarlaVehicleControl(Node):
         """速度规划"""
         planned_speed = 5
         reaction_stop_time = 5
-        reaction_stop_distance = self.vehicle_speed * reaction_stop_time
+        reaction_stop_distance = self.current_speed * reaction_stop_time
         
         # 接近终点减速
         if len(self.waypoints) > 0:
             goal = self.waypoints[-1]
             dist_to_goal = math.sqrt(
-                (self.vehicle_x - goal[0])**2 + (self.vehicle_y - goal[1])**2
+                (self.current_x - goal[0])**2 + (self.current_y - goal[1])**2
             )
             
             if dist_to_goal < reaction_stop_distance:
@@ -981,12 +976,33 @@ class CarlaVehicleControl(Node):
                 
                 waypoints = self.waypoints.copy()
                 current_waypoint_index = self.current_waypoint_index
-                current_x = self.vehicle_x
-                current_y = self.vehicle_y
-                current_yaw = self.vehicle_yaw
-                current_v = self.vehicle_speed
-                cur_time = time.time() - self.start_time
-            
+
+                if not self.is_spd_updated:
+                    self.current_speed += self.control_dt * self.measured_accel
+                else:
+                    self.current_speed = self.measured_speed
+                    self.is_spd_updated = False
+
+                # FIXME: self.ekf.is_updating python成员变量更新方式有待优化
+                if not self.ekf.is_updating and self.is_controlling:
+                    self.current_yaw += float(self.control_dt * self.current_speed * np.tan(self.current_steer) / self.vehicle_wheelbase)
+                    self.current_yaw = self.ekf.normalize_angle(self.current_yaw)
+                    self.current_x += self.control_dt * self.current_speed * np.cos(self.current_yaw)
+                    self.current_y += self.control_dt * self.current_speed * np.sin(self.current_yaw)
+                    # 高频更新预测状态
+                    self.ekf.x_hat = np.array([self.current_x, self.current_y, self.current_yaw])
+                else:
+                    self.current_x = float(self.ekf.x_hat[0])
+                    self.current_y = float(self.ekf.x_hat[1])
+                    self.current_yaw = float(self.ekf.x_hat[2])
+                    self.ekf.is_updating = False
+
+                current_x = self.current_x
+                current_y = self.current_y
+                current_yaw = self.current_yaw
+                current_v = self.current_speed
+
+
             # 检查是否到达目标
             if len(waypoints) > 0:
                 goal = waypoints[-1]
@@ -1019,7 +1035,8 @@ class CarlaVehicleControl(Node):
             # PID速度控制
             speed_error = planned_speed - current_v
             acceleration = self.speed_controller.compute(speed_error)
-            accel_error = acceleration - self.vehicle_accel
+            accel_error = acceleration - self.measured_accel
+            self.current_steer = steering_angle
 
             
             # 转换为油门/刹车
@@ -1059,14 +1076,14 @@ class CarlaVehicleControl(Node):
                 self.stanley.current_heading_error,
                 normalized_steer,
                 current_v,
-                self.vehicle_accel,
+                self.measured_accel,
                 throttle,
                 brake,
                 speed_error,
                 accel_error
             )
 
-            self.log_counter += 1
+            # self.log_counter += 1
             
             msg = CarlaEgoVehicleControl()
             msg.throttle = float(np.clip(throttle, 0.0, 1.0))
@@ -1074,6 +1091,7 @@ class CarlaVehicleControl(Node):
             msg.brake = float(np.clip(brake, 0.0, 1.0))
             msg.gear = 1
             self.control_pub.publish(msg)
+            self.is_controlling = True
                 
         except Exception as e:
             self.get_logger().error(f"控制循环错误: {e}")
@@ -1093,7 +1111,6 @@ class CarlaVehicleControl(Node):
             return
         
         # 重置控制状态
-        self.is_controlling = True
         self.current_waypoint_index = 0
         self.log_counter = 0
         # self.speed_controller.reset()  # 若有速度控制器，保留
