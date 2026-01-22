@@ -58,4 +58,3 @@ ros2 run vehicle_ctrl simple_ctrl
 source ~/ws/install/setup.bash 
 ros2 run vehicle_ctrl vehicle_plotter
 ```
-

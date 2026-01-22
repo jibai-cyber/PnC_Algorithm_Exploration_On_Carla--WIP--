@@ -132,63 +132,60 @@ class VehiclePlotter(Node):
             # 设置matplotlib使用非阻塞后端
             plt.ion()  # 开启交互模式
 
-            plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体为黑体
-            plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
-
             # 创建图形和子图（6个子图，2列3行布局：横向误差、航向误差、转向角、速度、油门、误差）
             self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4), (self.ax5, self.ax6)) = plt.subplots(3, 2, figsize=(14, 10))
-            self.fig.suptitle('车辆控制误差实时监控', fontsize=14, fontweight='bold')
+            self.fig.suptitle('Vehicle Control Error Real-time Monitoring', fontsize=14, fontweight='bold')
 
             # 初始化线条
-            self.line_cte, = self.ax1.plot([], [], 'b-', label='横向误差 (Cross Track Error)', linewidth=1.5)
-            self.line_he, = self.ax2.plot([], [], 'g-', label='航向误差 (Heading Error)', linewidth=1.5)
-            self.line_normalized_steer, = self.ax3.plot([], [], 'r-', label='归一化转向角 (Normalized Steer)', linewidth=1.5)
-            self.line_speed, = self.ax4.plot([], [], 'm-', label='车辆速度 (Vehicle Speed)', linewidth=1.5)
-            self.line_throttle, = self.ax5.plot([], [], 'c-', label='油门 (Throttle)', linewidth=1.5)
-            self.line_brake, = self.ax5.plot([], [], 'brown', label='刹车 (Brake)', linewidth=1.5)
-            self.line_speed_error, = self.ax6.plot([], [], 'orange', label='速度误差 (Speed Error)', linewidth=1.5)
-            self.line_accel_error, = self.ax6.plot([], [], 'purple', label='加速度误差 (Accel Error)', linewidth=1.5)
+            self.line_cte, = self.ax1.plot([], [], 'b-', label='Cross Track Error', linewidth=1.5)
+            self.line_he, = self.ax2.plot([], [], 'g-', label='Heading Error', linewidth=1.5)
+            self.line_normalized_steer, = self.ax3.plot([], [], 'r-', label='Normalized Steer', linewidth=1.5)
+            self.line_speed, = self.ax4.plot([], [], 'm-', label='Vehicle Speed', linewidth=1.5)
+            self.line_throttle, = self.ax5.plot([], [], 'c-', label='Throttle', linewidth=1.5)
+            self.line_brake, = self.ax5.plot([], [], 'brown', label='Brake', linewidth=1.5)
+            self.line_speed_error, = self.ax6.plot([], [], 'orange', label='Speed Error', linewidth=1.5)
+            self.line_accel_error, = self.ax6.plot([], [], 'purple', label='Accel Error', linewidth=1.5)
 
             # 设置子图1：横向误差
-            self.ax1.set_xlabel('时间 (s)', fontsize=10)
-            self.ax1.set_ylabel('横向误差 (m)', fontsize=10)
-            self.ax1.set_title('横向误差 (Cross Track Error)', fontsize=12)
+            self.ax1.set_xlabel('Time (s)', fontsize=10)
+            self.ax1.set_ylabel('Cross Track Error (m)', fontsize=10)
+            self.ax1.set_title('Cross Track Error', fontsize=12)
             self.ax1.grid(True, alpha=0.3)
             self.ax1.legend(loc='upper right')
             self.ax1.set_ylim([-2.0, 2.0])  # 初始范围，会自动调整
 
             # 设置子图2：航向误差
-            self.ax2.set_xlabel('时间 (s)', fontsize=10)
-            self.ax2.set_ylabel('航向误差 (rad)', fontsize=10)
-            self.ax2.set_title('航向误差 (Heading Error)', fontsize=12)
+            self.ax2.set_xlabel('Time (s)', fontsize=10)
+            self.ax2.set_ylabel('Heading Error (rad)', fontsize=10)
+            self.ax2.set_title('Heading Error', fontsize=12)
             self.ax2.grid(True, alpha=0.3)
             self.ax2.legend(loc='upper right')
             self.ax2.set_ylim([-1.0, 1.0])  # 初始范围，会自动调整
 
             # 设置子图3：归一化转向角
-            self.ax3.set_xlabel('时间 (s)', fontsize=10)
-            self.ax3.set_ylabel('归一化转向角', fontsize=10)
-            self.ax3.set_title('归一化转向角 (Normalized Steer)', fontsize=12)
+            self.ax3.set_xlabel('Time (s)', fontsize=10)
+            self.ax3.set_ylabel('Normalized Steer', fontsize=10)
+            self.ax3.set_title('Normalized Steer', fontsize=12)
             self.ax3.grid(True, alpha=0.3)
             self.ax3.legend(loc='upper right')
             self.ax3.set_ylim([-1.0, 1.0])  # 初始范围，会自动调整（CARLA转向范围是[-1, 1]）
 
             # 设置子图4：车辆速度和加速度（双Y轴）
-            self.ax4.set_xlabel('时间 (s)', fontsize=10)
-            self.ax4.set_ylabel('速度 (m/s)', fontsize=10, color='m')
-            self.ax4.set_title('车辆速度和加速度 (Vehicle Speed & Acceleration)', fontsize=12)
+            self.ax4.set_xlabel('Time (s)', fontsize=10)
+            self.ax4.set_ylabel('Speed (m/s)', fontsize=10, color='m')
+            self.ax4.set_title('Vehicle Speed & Acceleration', fontsize=12)
             self.ax4.grid(True, alpha=0.3)
             self.ax4.tick_params(axis='y', labelcolor='m')
             self.ax4.set_ylim([0.0, 10.0])  # 初始范围，会自动调整
 
             # 创建右侧Y轴用于加速度
             self.ax4_accel = self.ax4.twinx()
-            self.ax4_accel.set_ylabel('加速度 (m/s²)', fontsize=10, color='y')
+            self.ax4_accel.set_ylabel('Acceleration (m/s²)', fontsize=10, color='y')
             self.ax4_accel.tick_params(axis='y', labelcolor='y')
             self.ax4_accel.set_ylim([-5.0, 5.0])  # 初始范围，会自动调整
 
             # 在右侧Y轴上创建加速度线条
-            self.line_accel, = self.ax4_accel.plot([], [], 'y-', label='车辆加速度 (Vehicle Acceleration)', linewidth=1.5)
+            self.line_accel, = self.ax4_accel.plot([], [], 'y-', label='Vehicle Acceleration', linewidth=1.5)
 
             # 合并图例
             lines1, labels1 = self.ax4.get_legend_handles_labels()
@@ -196,17 +193,17 @@ class VehiclePlotter(Node):
             self.ax4.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
 
             # 设置子图5：油门和刹车
-            self.ax5.set_xlabel('时间 (s)', fontsize=10)
-            self.ax5.set_ylabel('油门/刹车', fontsize=10)
-            self.ax5.set_title('油门和刹车 (Throttle & Brake)', fontsize=12)
+            self.ax5.set_xlabel('Time (s)', fontsize=10)
+            self.ax5.set_ylabel('Throttle/Brake', fontsize=10)
+            self.ax5.set_title('Throttle & Brake', fontsize=12)
             self.ax5.grid(True, alpha=0.3)
             self.ax5.legend(loc='upper right')
             self.ax5.set_ylim([0.0, 1.0])  # 初始范围，会自动调整
 
             # 设置子图6：速度/加速度误差
-            self.ax6.set_xlabel('时间 (s)', fontsize=10)
-            self.ax6.set_ylabel('误差值', fontsize=10)
-            self.ax6.set_title('速度/加速度误差 (Speed/Accel Error)', fontsize=12)
+            self.ax6.set_xlabel('Time (s)', fontsize=10)
+            self.ax6.set_ylabel('Error Value', fontsize=10)
+            self.ax6.set_title('Speed/Accel Error', fontsize=12)
             self.ax6.grid(True, alpha=0.3)
             self.ax6.legend(loc='upper right')
             self.ax6.set_ylim([-5.0, 5.0])  # 初始范围，会自动调整

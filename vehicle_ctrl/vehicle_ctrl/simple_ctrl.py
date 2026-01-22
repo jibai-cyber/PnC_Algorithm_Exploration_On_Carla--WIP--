@@ -209,6 +209,100 @@ class PIDController:
         return output
 
 
+class BicycleModelEKF:
+    """
+    基于自行车模型的扩展卡尔曼滤波器
+    用于车辆位置和航向角跟踪
+    """
+
+    def __init__(self, x0, P0, Q, R, l=2.8, dt=0.1):
+        self.x_hat = np.array(x0, dtype=float)  # 状态估计 [x, y, phi]
+        self.P = np.array(P0, dtype=float)      # 估计协方差
+        self.x_pred = None                      # 预测状态
+        self.P_pred = None                      # 预测协方差
+
+        # 噪声协方差矩阵
+        self.Q = np.array(Q, dtype=float)       # 过程噪声协方差
+        self.R = np.array(R, dtype=float)       # 观测噪声协方差
+
+        # 车辆参数
+        self.l = float(l)                       # 轴距
+        self.dt = float(dt)                     # 采样时间
+
+    def normalize_angle(self, angle):
+        normalized = angle
+        while normalized > np.pi:
+            normalized -= 2 * np.pi
+        while normalized < -np.pi:
+            normalized += 2 * np.pi
+        return normalized
+
+    def motion_model(self, x, u):
+        v, delta = u
+        phi = x[2]
+
+        # 离散运动方程
+        x_new = x[0] + v * np.cos(phi) * self.dt
+        y_new = x[1] + v * np.sin(phi) * self.dt
+        phi_new = phi + (v * np.tan(delta) / self.l) * self.dt
+
+        # 角度归一化
+        phi_new = self.normalize_angle(phi_new)
+
+        return np.array([x_new, y_new, phi_new])
+
+    def compute_jacobian_F(self, x, u):
+        v = u[0]
+        phi = x[2]
+
+        # 初始化单位矩阵
+        F = np.eye(3, dtype=float)
+
+        # 设置非零偏导数
+        F[0, 2] = -v * np.sin(phi) * self.dt
+        F[1, 2] = v * np.cos(phi) * self.dt
+        # F[2, 2] = 1
+
+        return F
+
+    def predict(self, u):
+        # 1. 状态预测
+        self.x_pred = self.motion_model(self.x_hat, u)
+
+        # 2. 计算雅可比矩阵 F
+        F = self.compute_jacobian_F(self.x_hat, u)
+
+        # 3. 协方差预测: P_pred = F * P * F^T + Q
+        self.P_pred = F @ self.P @ F.T + self.Q
+
+        return self.x_pred, self.P_pred
+
+    def update(self, z):
+        
+        H = np.eye(3, dtype=float)
+
+        S = H @ self.P_pred @ H.T + self.R
+
+        K = self.P_pred @ H.T @ np.linalg.inv(S)
+
+        y = z - self.x_pred
+
+        # 角度归一化
+        y[2] = self.normalize_angle(y[2])
+
+        self.x_hat = self.x_pred + K @ y
+
+        self.x_hat[2] = self.normalize_angle(self.x_hat[2])
+
+        I = np.eye(3, dtype=float)
+        self.P = (I - K @ H) @ self.P_pred @ (I - K @ H).T + K @ self.R @ K.T
+
+        return self.x_hat, self.P
+
+    def step(self, u, z):
+        self.predict(u)
+        return self.update(z)[0]  # 返回更新后的状态
+
 class CarlaVehicleControl(Node):
     """车辆控制节点"""
     
@@ -296,9 +390,15 @@ class CarlaVehicleControl(Node):
         self.filtered_actual_spd = 0.0  # 滤波后的速度
         self.filtered_actual_throttle = 0.3  # 滤波后的油门
         self.filtered_actual_brake = 0.0  # 滤波后的刹车
-        self.filtered_actual_x = 0.0  # 滤波后的位置x
-        self.filtered_actual_y = 0.0  # 滤波后的位置y
-        self.filtered_actual_yaw = 0.0  # 滤波后的姿态yaw
+
+        # EKF相关参数
+        self.ekf_x0 = [0.0, 0.0, 0.0]  # 初始状态 [x, y, phi]
+        self.ekf_P0 = np.diag([1.0, 1.0, 0.5])  # 初始协方差矩阵
+        self.ekf_Q = np.diag([0.1, 0.1, 0.01])  # 过程噪声协方差
+        self.ekf_R = np.diag([0.5, 0.5, 0.05])  # 观测噪声协方差
+        self.ekf_dt = 0.13  # 采样时间 (s)
+        self.ekf = None
+        self.last_control_input = np.array([0.0, 0.0])  # 上一次控制输入 [v, delta]
 
         # 油门刹车切换相关参数
         self.prev_throttle = 0.3
@@ -490,10 +590,8 @@ class CarlaVehicleControl(Node):
         new_transform = self.ego_vehicle.get_transform()
         new_yaw = new_transform.rotation.yaw/360.0*2*math.pi
 
-        # 更新滤波器初始位置
-        self.filtered_actual_x = new_loc.x
-        self.filtered_actual_y = new_loc.y
-        self.filtered_actual_yaw = new_yaw
+        # 重新初始化EKF
+        self.initialize_ekf(new_loc.x, new_loc.y, new_yaw)
         self.get_logger().info(f"移动后位置: ({new_loc.x:.2f}, {new_loc.y:.2f}, {new_loc.z:.2f})")
         self.get_logger().info(f"移动后航向角: {new_yaw:.2f}°")
         self.get_logger().info(f"{GREEN}✓ 车辆已移动到中心线: ({x:.2f}, {y:.2f}){RESET}")
@@ -535,7 +633,6 @@ class CarlaVehicleControl(Node):
         try:
             # 获取车辆类型ID
             self.vehicle_type_id = msg.id
-            print(f"vehicle_type_id: {self.vehicle_type_id}")
             
             # 获取轴距（wheelbase）
             # CARLA的vehicle_info中，wheelbase可能在wheels信息中
@@ -615,39 +712,63 @@ class CarlaVehicleControl(Node):
             
         except Exception as e:
             self.get_logger().error(f"处理车辆信息时出错: {e}，使用默认值")
-    
+
+    def initialize_ekf(self, x, y, yaw):
+        """初始化EKF"""
+        self.ekf_x0 = [x, y, yaw]
+        self.ekf = BicycleModelEKF(
+            x0=self.ekf_x0,
+            P0=self.ekf_P0,
+            Q=self.ekf_Q,
+            R=self.ekf_R,
+            l=self.vehicle_wheelbase,
+            dt=self.ekf_dt
+        )
+        self.get_logger().info(f"EKF已初始化: 初始状态 {self.ekf_x0}")
+
     def odometry_callback(self, msg):
-        """里程计回调"""
+        """里程计回调 - 使用EKF进行状态估计"""
         with self.data_lock:
+            # 获取原始测量值
             raw_x = msg.pose.pose.position.x
             raw_y = msg.pose.pose.position.y
+            orientation_q = msg.pose.pose.orientation
+            _, _, raw_yaw = euler_from_quaternion(
+                [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+            )
+
+            # 添加噪声（模拟传感器噪声）
             if self.enable_noise:
                 noise_x = np.random.normal(0.0, self.odom_noise_std_x)
                 noise_y = np.random.normal(0.0, self.odom_noise_std_y)
-                self.vehicle_x = raw_x + noise_x
-                self.vehicle_y = raw_y + noise_y
-            else:
-                self.vehicle_x = raw_x
-                self.vehicle_y = raw_y
-            
-            # FIXME:改用卡尔曼滤波
-            # self.filtered_actual_x = self.filter_alpha_x * self.vehicle_x + (1 - self.filter_alpha_x) * self.filtered_actual_x
-            # self.filtered_actual_y = self.filter_alpha_y * self.vehicle_y + (1 - self.filter_alpha_y) * self.filtered_actual_y
-            # self.vehicle_x = self.filtered_actual_x
-            # self.vehicle_y = self.filtered_actual_y
-            
-            orientation_q = msg.pose.pose.orientation
-            _, _, yaw = euler_from_quaternion(
-                [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
-            )
-            if self.enable_noise:
                 noise_yaw = np.random.normal(0.0, self.odom_noise_std_yaw)
-                self.vehicle_yaw = yaw + noise_yaw
+                measured_x = raw_x + noise_x
+                measured_y = raw_y + noise_y
+                measured_yaw = raw_yaw + noise_yaw
             else:
-                self.vehicle_yaw = yaw
-            
-            # self.filtered_actual_yaw = self.filter_alpha_yaw * self.vehicle_yaw + (1 - self.filter_alpha_yaw) * self.filtered_actual_yaw
-            # self.vehicle_yaw = self.filtered_actual_yaw
+                measured_x = raw_x
+                measured_y = raw_y
+                measured_yaw = raw_yaw
+
+            # 初始化EKF（如果还未初始化）
+            if self.ekf is None:
+                self.initialize_ekf(measured_x, measured_y, measured_yaw)
+                self.vehicle_x = measured_x
+                self.vehicle_y = measured_y
+                self.vehicle_yaw = measured_yaw
+                return
+
+            # 准备观测值 [x, y, phi]
+            z = np.array([measured_x, measured_y, measured_yaw])
+
+            # 执行EKF步骤 (预测 + 更新)
+            # 使用上一次的控制输入进行预测
+            x_est = self.ekf.step(self.last_control_input, z)
+
+            # 更新车辆状态
+            self.vehicle_x = x_est[0]
+            self.vehicle_y = x_est[1]
+            self.vehicle_yaw = x_est[2]
     
     # FIXME: 采样点过于密集，当前间距0.1m
     def downsample_path(self, path, interval=1.0):
@@ -688,18 +809,18 @@ class CarlaVehicleControl(Node):
         with self.data_lock:
             self.waypoints = new_waypoints
             
-            # 找到最近的路径点作为起始索引
-            if len(new_waypoints) > 0:
-                min_dist = float('inf')
-                closest_idx = 0
-                for i, wp in enumerate(new_waypoints):
-                    dist = math.sqrt((self.vehicle_x - wp[0])**2 + (self.vehicle_y - wp[1])**2)
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_idx = i
-                self.current_waypoint_index = closest_idx
-            else:
-                self.current_waypoint_index = 0
+            # # 找到最近的路径点作为起始索引
+            # if len(new_waypoints) > 0:
+            #     min_dist = float('inf')
+            #     closest_idx = 0
+            #     for i, wp in enumerate(new_waypoints):
+            #         dist = math.sqrt((self.vehicle_x - wp[0])**2 + (self.vehicle_y - wp[1])**2)
+            #         if dist < min_dist:
+            #             min_dist = dist
+            #             closest_idx = i
+            #     self.current_waypoint_index = closest_idx
+            # else:
+            self.current_waypoint_index = 0
             
             # 计算路径曲率
             self.path_curvatures = self.compute_curvatures(new_waypoints)
@@ -739,7 +860,11 @@ class CarlaVehicleControl(Node):
         # 重置Stanley控制器滤波状态
         self.stanley.filtered_cross_track_error = 0.0
         self.stanley.filtered_heading_error = 0.0
-        
+
+        # 重置EKF
+        self.ekf = None
+        self.last_control_input = np.array([0.0, 0.0])
+
         # 清空目标点
         self.goal_pose = None
         
@@ -799,54 +924,9 @@ class CarlaVehicleControl(Node):
     # FIXME: 后期考虑用交互模型，局部避障规划或speed profile规划速度
     def plan_speed(self):
         """速度规划"""
-        # if not self.waypoints or self.current_waypoint_index >= len(self.waypoints):
-        #     return self.min_speed
-        
-        # current_v = self.vehicle_speed
-        
-        # # 基于曲率规划速度
-        # max_lateral_accel = 2.5
-        # preview_distance = 5.0 + 1.0 * max(current_v, 0.0)
-        
-        # # 计算前瞻窗口内的最大曲率
-        # max_kappa = 0.0
-        # acc_dist = 0.0
-        
-        # for i in range(self.current_waypoint_index, len(self.waypoints) - 1):
-        #     if acc_dist > preview_distance:
-        #         break
-            
-        #     if i < len(self.path_curvatures):
-        #         max_kappa = max(max_kappa, abs(self.path_curvatures[i]))
-            
-        #     if i + 1 < len(self.waypoints):
-        #         seg = np.linalg.norm(
-        #             np.array(self.waypoints[i + 1]) - np.array(self.waypoints[i])
-        #         )
-        #         acc_dist += seg
-        
-        # 基于曲率计算速度
-        """
-        FIXME: 
-        取极大值容易受噪声影响，可以考虑取算数平均值; 
-        且规划的速度不连续，max_speed和max_lateral_accel这两者应该由另一方定义，而非直接赋值为常数
-        转弯需要设定一个速度下限值
-        """
-        # if max_kappa < 1e-6:
-        #     planned_speed = self.max_speed
-        # else:
-        #     planned_speed = math.sqrt(max_lateral_accel / max_kappa)
-        
-        # planned_speed = np.clip(planned_speed, self.min_speed, self.max_speed)
-
-        # FIXME: 临时测试，后期删除
-        # if self.log_counter / 20 > 15 and self.log_counter / 20 < 35:
-        #     planned_speed = 7
-        # elif self.log_counter / 20 > 35:
-        #     planned_speed = 2
-        # else:
-        #     planned_speed = 3.5
         planned_speed = 5
+        reaction_stop_time = 5
+        reaction_stop_distance = self.vehicle_speed * reaction_stop_time
         
         # 接近终点减速
         if len(self.waypoints) > 0:
@@ -855,10 +935,12 @@ class CarlaVehicleControl(Node):
                 (self.vehicle_x - goal[0])**2 + (self.vehicle_y - goal[1])**2
             )
             
-            # FIXME: 减速距离应该和速度有关，否则PID难以在短时间内收敛
-            if dist_to_goal < 5.0:
+            if dist_to_goal < reaction_stop_distance:
                 # 线性减速
-                planned_speed = min(planned_speed, max(0.5, dist_to_goal / 5.0 * planned_speed))
+                planned_speed = min(planned_speed, dist_to_goal / reaction_stop_distance * planned_speed)
+
+            if dist_to_goal < 0.5:
+                planned_speed = 0.0
         
         return float(planned_speed)
     
@@ -892,7 +974,6 @@ class CarlaVehicleControl(Node):
     
     def control_loop(self):
         """控制循环"""
-        st_time = time.time()
         try:
             with self.data_lock:
                 if not self.waypoints:
@@ -905,7 +986,6 @@ class CarlaVehicleControl(Node):
                 current_yaw = self.vehicle_yaw
                 current_v = self.vehicle_speed
                 cur_time = time.time() - self.start_time
-                # print(f"cur_time: {cur_time}")
             
             # 检查是否到达目标
             if len(waypoints) > 0:
@@ -928,10 +1008,13 @@ class CarlaVehicleControl(Node):
             )
 
             self.current_waypoint_index = nearest_idx
-            print(f"current_waypoint_index: {current_waypoint_index}, nearest_idx: {nearest_idx}")
-            
+
             # 速度规划
             planned_speed = self.plan_speed()
+
+            # 更新EKF控制输入 [v, delta]
+            # delta 是前轮转角，steering_angle 是 Stanley 控制器输出的转向角
+            self.last_control_input = np.array([current_v, steering_angle])
             
             # PID速度控制
             speed_error = planned_speed - current_v
