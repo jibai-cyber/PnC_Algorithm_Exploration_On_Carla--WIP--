@@ -56,3 +56,19 @@ TODO:
 ---
 version 1.3.1
 1. 改进里程计数据融合，与控制器同频
+
+---
+version 1.4
+1. 优化代码结构
+vehicle_ctrl/vehicle_ctrl/
+├── __init__.py
+├── constants.py              # 常量定义
+├── stanley_controller.py     # Stanley控制器
+├── pid_controller.py        # PID控制器
+├── bicycle_model_ekf.py     # EKF滤波器
+├── carla_vehicle_control.py # 主控制节点
+└── simple_ctrl.py          # 主入口（仅main函数）
+
+TODO:
+1. 完善路径平滑和速度规划
+2. 订阅环境信息，为后续避障算法提供支撑
