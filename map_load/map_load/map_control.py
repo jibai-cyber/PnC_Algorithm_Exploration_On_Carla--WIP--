@@ -9,7 +9,7 @@
 4. 可视化：发布车辆、路径、waypoint等marker
 
 主要特性：
-- 使用lanelet2库加载地图（与control-with-traffic-light.py相同）
+- 使用lanelet2库加载地图
 - 从lanelet2地图提取道路中心线用于路径规划
 - 起点/终点自动对齐到道路中心线
 - 路径完全沿着道路中心线
@@ -34,6 +34,11 @@ from ament_index_python.packages import get_package_share_directory, PackageNotF
 import numpy as np
 
 class MapControlNode(Node):
+    """
+    1. 加载地图，提取中心线
+    2. 根据各lanelet起点终点连接情况，用lanelet_id构建拓扑图
+    3. 用A*算法做全局规划，并根据lanlet_id拼接路径段
+    """
     def __init__(self):
         super().__init__('map_control_node')
         
@@ -49,13 +54,41 @@ class MapControlNode(Node):
             self.osm_file = os.path.join(package_dir, 'resource', 'rviz_map_zitu._fixed.osm')
             self.get_logger().warn(f"Package 'map_load' not found in ROS index. Using relative path: {self.osm_file}")
          	 
-        # 使用lanelet2库加载地图（与control-with-traffic-light.py相同）
+        # 使用lanelet2库加载地图
         self.lanelet_map = None
         
         # 地图发布器
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.map_publisher = self.create_publisher(MarkerArray, 'lanelet2_map', qos_profile)
+
+        # 车辆状态
+        self.initial_pose = None
+        self.goal_pose = None
+
+        self.vehicle_spawned = False
+
+        self.current_pose = None
+        self.current_velocity = Twist()
+        
+        # 路径发布控制
+        self.path_published = False
+        
+        # 起点和终点的lanelet_id（用于路径规划）
+        self.start_lanelet_id = None
+        self.goal_lanelet_id = None
+        
+        # 停车检测
+        self._stopped_since = None
+        self._stop_speed_threshold_ms = 0.05
+        self._stop_duration_sec = 0.1
+        self.k_zeroval = 1e-4
+        
+        # 路径规划参数
+        self.waypoints = []
+        self.current_waypoint_index = 0
+        self.path_resolution = 1  # 0.1米，提供足够密集的路径点用于精确控制
+        self.waypoint_display_interval = 4  # 每隔4个点显示一个marker（2米间隔）
         
         # 加载地图并提取中心线
         self.load_map()  # 使用lanelet2库加载
@@ -104,30 +137,6 @@ class MapControlNode(Node):
             100
         )
         
-        # 车辆状态
-        self.initial_pose = None
-        self.goal_pose = None
-
-        self.vehicle_spawned = False
-
-        self.current_pose = None
-        self.current_velocity = Twist()
-        
-        # 路径发布控制
-        self.path_published = False
-        
-        # 停车检测
-        self._stopped_since = None
-        self._stop_speed_threshold_ms = 0.05
-        self._stop_duration_sec = 0.1
-        self.k_zeroval = 1e-4
-        
-        # 路径规划参数（参考control-with-traffic-light.py）
-        self.waypoints = []
-        self.current_waypoint_index = 0
-        self.path_resolution = 0.5  # 0.5米，提供足够密集的路径点用于精确控制
-        self.waypoint_display_interval = 4  # 每隔4个点显示一个marker（2米间隔）
-        
         # 中心线可视化发布器
         self.centerline_marker_pub = self.create_publisher(MarkerArray, '/centerlines', qos_profile)
         
@@ -143,7 +152,7 @@ class MapControlNode(Node):
         self.get_logger().info("2. '2D Nav Goal' 设置目标点（自动调整到道路中心线）")
     
     def load_map(self):
-        """使用lanelet2库加载地图（与control-with-traffic-light.py相同）"""
+        """使用lanelet2库加载地图"""
         try:
             # 使用UtmProjector加载地图
             projector = UtmProjector(lanelet2.io.Origin(0, 0))
@@ -153,341 +162,134 @@ class MapControlNode(Node):
             self.get_logger().error(f"❌ lanelet2库加载地图失败: {str(e)}")
             raise RuntimeError(f"地图加载失败: {str(e)}")
     
-    def extract_centerlines(self):
+    def _uniform_sample_path(self, path_points):
         """
-        从lanelet2地图提取道路中心线 - 使用control-with-traffic-light.py的方法
+        先计算路径总长度，然后根据 path_resolution 均匀采样
         
-        方法（与control-with-traffic-light.py完全相同）：
-        1. 使用lanelet2库直接获取leftBound和rightBound
-        2. 直接按索引对应计算中心线原始点
-        3. 对中心线进行密集采样（每10cm一个点）
+        Args:
+            path_points: 原始路径点列表 [(x1, y1), (x2, y2), ...]
+            
+        Returns:
+            均匀采样后的路径点列表
         """
-        self.centerlines = {}  # {lanelet_id: centerline_points}
+        if len(path_points) < 2:
+            return path_points
+        
+        # 1. 计算路径总长度和累积长度
+        cumulative_lengths = [0.0]
+        total_length = 0.0
+        
+        for i in range(len(path_points) - 1):
+            p1 = path_points[i]
+            p2 = path_points[i + 1]
+            seg_length = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+            total_length += seg_length
+            cumulative_lengths.append(total_length)
+        
+        # 如果总长度小于分辨率，直接返回起点和终点
+        if total_length < self.path_resolution:
+            return [path_points[0], path_points[-1]]
+        
+        # 2. 根据总长度和 path_resolution 计算采样点数
+        # uniform_slice 的思路：将 [0, total_length] 均匀分割成 num+1 个点
+        num_samples = max(1, int(total_length / self.path_resolution))
+        
+        # 3. 均匀采样：在 [0, total_length] 上均匀采样
+        sampled_lengths = []
+        if num_samples > 0:
+            delta = self.path_resolution
+            for i in range(num_samples + 1):
+                sampled_lengths.append(i * delta)
+        
+        # 确保最后一个点是路径终点
+        if len(sampled_lengths) > 0:
+            sampled_lengths[-1] = total_length
+        
+        # 4. 根据采样点的弧长位置，在路径上找到对应的 (x, y) 坐标
+        sampled_points = []
+        
+        for target_s in sampled_lengths:
+            # 找到第一个 cumulative_lengths[i+1] >= target_s 的位置
+            left, right = 0, len(cumulative_lengths) - 1
+            seg_index = 0
+            
+            while left < right:
+                mid = (left + right) // 2
+                if cumulative_lengths[mid + 1] < target_s:
+                    left = mid + 1
+                else:
+                    right = mid
+            
+            seg_index = left
+            
+            # 确保 seg_index 不越界
+            if seg_index >= len(path_points) - 1:
+                seg_index = len(path_points) - 2
+            
+            # 在当前段内插值
+            p1 = path_points[seg_index]
+            p2 = path_points[seg_index + 1]
+            
+            seg_start_s = cumulative_lengths[seg_index]
+            seg_end_s = cumulative_lengths[seg_index + 1]
+            
+            if abs(seg_end_s - seg_start_s) < 1e-6:
+                # 段长度为0，直接使用起点
+                sampled_points.append(p1)
+            else:
+                # 计算插值比例
+                ratio = (target_s - seg_start_s) / (seg_end_s - seg_start_s)
+                ratio = max(0.0, min(1.0, ratio))  # 限制在 [0, 1] 范围内
+                
+                x = p1[0] + ratio * (p2[0] - p1[0])
+                y = p1[1] + ratio * (p2[1] - p1[1])
+                sampled_points.append((x, y))
+        
+        return sampled_points
+    
+    def extract_centerlines(self):
+        """提取lanelet的起始点和终点，用于构建拓扑图"""
+        self.centerlines = {}
         self.lanelet_ids = []
         
         # 确保lanelet2库已加载
         if self.lanelet_map is None:
             self.get_logger().error("❌ lanelet2库未加载，无法提取中心线")
             return
-        
-        # 采样间隔（米）- 与control-with-traffic-light.py相同
-        sampling_resolution = 0.1  # 每10cm一个点
-        
-        # 遍历所有lanelet（与control-with-traffic-light.py完全相同）
+                
+        # FIXME: 直接将整条路径拼接成一个centerline去采样，不要一个个lanelet处理，否则可能导致路径间有间断
+        # TODO: 先粗略的采样再线性插值到0.25m，否则路径会过拟合
+        # TODO: plan_speed用简易的，当前曲率用前轮转角得到
+        # TODO: 两个断开的点之间三次多项式插值
         for lanelet_ in self.lanelet_map.laneletLayer:
             # 只处理道路类型的 lanelet，排除标线、人行道等
             if "subtype" not in lanelet_.attributes.keys() or lanelet_.attributes["subtype"] == "road":
                 lanelet_id = lanelet_.id
                 self.lanelet_ids.append(lanelet_id)
                 
-                # 获取左右边界（与control-with-traffic-light.py完全相同）
                 left_bound = [lanelet2.geometry.to2D(p) for p in lanelet_.leftBound]
                 right_bound = [lanelet2.geometry.to2D(p) for p in lanelet_.rightBound]
                 
-                # 计算中心线的原始点（与control-with-traffic-light.py完全相同）
-                centerline_rough = []
+                # 只计算起始点和终点
                 min_len = min(len(left_bound), len(right_bound))
-                
-                for i in range(min_len):
-                    center_x = (left_bound[i].x + right_bound[i].x) / 2.0
-                    center_y = (left_bound[i].y + right_bound[i].y) / 2.0
-                    # 直接使用 lanelet2 坐标，不需要坐标变换（OSM地图已经是准的）
-                    centerline_rough.append((center_x, center_y))
-                
-                # 对中心线进行密集采样（与control-with-traffic-light.py完全相同）
-                centerline = []
-                for i in range(len(centerline_rough) - 1):
-                    p1 = centerline_rough[i]
-                    p2 = centerline_rough[i + 1]
+                if min_len > 0:
+                    # 起始点
+                    start_x = (left_bound[0].x + right_bound[0].x) / 2.0
+                    start_y = (left_bound[0].y + right_bound[0].y) / 2.0
+                    # 终点
+                    end_x = (left_bound[-1].x + right_bound[-1].x) / 2.0
+                    end_y = (left_bound[-1].y + right_bound[-1].y) / 2.0
                     
-                    # 计算两点间距离
-                    seg_length = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-                    
-                    # 计算采样点数
-                    num_samples = max(1, int(seg_length / sampling_resolution))
-                    
-                    # 在两点间采样
-                    for j in range(num_samples + 1):
-                        ratio = j / num_samples
-                        x = p1[0] + ratio * (p2[0] - p1[0])
-                        y = p1[1] + ratio * (p2[1] - p1[1])
-                        centerline.append((x, y))
-                
-                self.centerlines[lanelet_id] = centerline
-        
-        # 统计总点数
-        total_points = sum(len(points) for points in self.centerlines.values())
-        self.get_logger().info(f"提取了 {len(self.centerlines)} 条中心线，共 {total_points} 个采样点")
-        self.get_logger().info(f"中心线提取方法：使用 lanelet2 库（与 control-with-traffic-light.py 相同）")
-        
-        # 诊断：检查中心线的质量
-        if len(self.centerlines) > 0:
-            all_x = []
-            all_y = []
-            for centerline in self.centerlines.values():
-                for point in centerline:
-                    all_x.append(point[0])
-                    all_y.append(point[1])
-            
-            if len(all_x) > 0:
-                min_x, max_x = min(all_x), max(all_x)
-                min_y, max_y = min(all_y), max(all_y)
-                center_x = (min_x + max_x) / 2
-                center_y = (min_y + max_y) / 2
-                self.get_logger().info(f"🗺️ 中心线范围: X[{min_x:.2f}, {max_x:.2f}] Y[{min_y:.2f}, {max_y:.2f}]")
-                self.get_logger().info(f"🎯 中心线中心: ({center_x:.2f}, {center_y:.2f})")
-                
-                centerline_lengths = []
-                for lanelet_id, centerline in self.centerlines.items():
-                    if len(centerline) > 1:
-                        length = 0.0
-                        for i in range(len(centerline) - 1):
-                            dx = centerline[i+1][0] - centerline[i][0]
-                            dy = centerline[i+1][1] - centerline[i][1]
-                            length += math.sqrt(dx*dx + dy*dy)
-                        centerline_lengths.append((lanelet_id, length))
-                
-                if centerline_lengths:
-                    avg_length = sum(l[1] for l in centerline_lengths) / len(centerline_lengths)
-                    max_length = max(l[1] for l in centerline_lengths)
-                    min_length = min(l[1] for l in centerline_lengths)
-                    self.get_logger().info(f"📏 中心线长度统计: 平均={avg_length:.2f}m, 最长={max_length:.2f}m, 最短={min_length:.2f}m")
-    
-    def _compute_centerline_direct(self, left_points, right_points, sampling_resolution):
-        """
-        直接对应方法计算中心线 - 完全按照 control-with-traffic-light.py 的方法实现
-        
-        步骤（与 control-with-traffic-light.py 完全相同）：
-        1. 使用 min_len 直接按索引对应左右边界点
-        2. 计算中心线原始点（中点）
-        3. 对中心线进行密集采样（在原始点之间均匀采样，每10cm一个点）
-        
-        注意：control-with-traffic-light.py 使用 lanelet2 库获取边界，
-        这里从 OSM XML 解析的边界点顺序应该与 lanelet2 库一致
-        """
-        if len(left_points) == 0 or len(right_points) == 0:
-            return []
-        
-        # 步骤1：直接按索引对应（与control-with-traffic-light.py完全相同）
-        # 使用 min_len = min(len(left_bound), len(right_bound))
-        centerline_rough = []
-        min_len = min(len(left_points), len(right_points))
-        
-        for i in range(min_len):
-            center_x = (left_points[i][0] + right_points[i][0]) / 2.0
-            center_y = (left_points[i][1] + right_points[i][1]) / 2.0
-            # 注意：control-with-traffic-light.py 在这里应用坐标变换 transform_coordinates
-            # 但 map_control.py 直接使用 local_x/local_y，不需要变换
-            centerline_rough.append((center_x, center_y))
-        
-        # 步骤2：对中心线进行密集采样（与control-with-traffic-light.py完全相同）
-        centerline = []
-        for i in range(len(centerline_rough) - 1):
-            p1 = centerline_rough[i]
-            p2 = centerline_rough[i + 1]
-            
-            # 计算两点间距离
-            seg_length = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-            
-            # 计算采样点数（与control-with-traffic-light.py相同）
-            num_samples = max(1, int(seg_length / sampling_resolution))
-            
-            # 在两点间采样（与control-with-traffic-light.py完全相同：range(num_samples + 1)）
-            # 注意：control-with-traffic-light.py 使用 range(num_samples + 1)，包含起点和终点
-            for j in range(num_samples + 1):
-                ratio = j / num_samples
-                x = p1[0] + ratio * (p2[0] - p1[0])
-                y = p1[1] + ratio * (p2[1] - p1[1])
-                centerline.append((x, y))
-        
-        # control-with-traffic-light.py 不单独添加最后一个点，因为已经在循环中包含了
-        # 但为了确保完整性，如果 centerline_rough 只有一个点，需要添加
-        if len(centerline_rough) == 1:
-            centerline.append(centerline_rough[0])
-        
-        return centerline
-    
-    def _compute_centerline_parameterized(self, left_points, right_points, sampling_resolution):
-        """
-        使用参数化方法计算中心线，确保左右边界正确匹配
-        
-        原理：
-        1. 计算左右边界的总长度
-        2. 将左右边界参数化到[0, 1]范围
-        3. 对于每个参数t，在左右边界上找到对应的点
-        4. 计算两个对应点的中点作为中心线点
-        
-        优势：
-        - 即使左右边界点数不同，也能正确匹配
-        - 中心线更准确地反映道路的几何中心
-        """
-        if len(left_points) < 2 or len(right_points) < 2:
-            return []
-        
-        # 计算左右边界的总长度
-        def compute_path_length(points):
-            """计算路径的总长度"""
-            total = 0.0
-            for i in range(len(points) - 1):
-                dx = points[i+1][0] - points[i][0]
-                dy = points[i+1][1] - points[i][1]
-                total += math.sqrt(dx*dx + dy*dy)
-            return total
-        
-        left_length = compute_path_length(left_points)
-        right_length = compute_path_length(right_points)
-        
-        # 使用较长的边界作为参考长度（确保采样足够密集）
-        reference_length = max(left_length, right_length)
-        
-        if reference_length < 0.01:  # 太短，跳过
-            return []
-        
-        # 计算需要多少个采样点（基于采样分辨率）
-        num_samples = max(2, int(reference_length / sampling_resolution) + 1)
-        
-        centerline = []
-        
-        # 对每个采样点，计算对应的中心线点
-        for i in range(num_samples):
-            # 参数化到[0, 1]
-            t = i / (num_samples - 1) if num_samples > 1 else 0.0
-            
-            # 在左边界上找到对应参数的点（按路径长度比例）
-            left_point = self._get_point_at_parameter(left_points, t)
-            
-            # 在右边界上找到对应参数的点（按路径长度比例）
-            right_point = self._get_point_at_parameter(right_points, t)
-            
-            # 计算中心点（左右边界对应点的中点）
-            center_x = (left_point[0] + right_point[0]) / 2.0
-            center_y = (left_point[1] + right_point[1]) / 2.0
-            centerline.append((center_x, center_y))
-        
-        # 去重：移除距离太近的连续点（避免重复点导致断开）
-        if len(centerline) > 1:
-            deduplicated = [centerline[0]]
-            for i in range(1, len(centerline)):
-                dist = math.sqrt((centerline[i][0] - deduplicated[-1][0])**2 + 
-                               (centerline[i][1] - deduplicated[-1][1])**2)
-                if dist > 0.01:  # 只保留距离大于1cm的点
-                    deduplicated.append(centerline[i])
-            centerline = deduplicated
-        
-        return centerline
-    
-    def _interpolate_points(self, points, target_count):
-        """
-        通过插值补全点，使点数达到目标数量
-        用于处理左右边界点数差异过大的情况
-        """
-        if len(points) < 2 or target_count <= len(points):
-            return points
-        
-        if len(points) == 0:
-            return points
-        
-        if len(points) == 1:
-            # 如果只有一个点，复制该点
-            return [points[0]] * target_count
-        
-        # 计算原始路径的总长度
-        total_length = 0.0
-        segment_lengths = []
-        for i in range(len(points) - 1):
-            dx = points[i+1][0] - points[i][0]
-            dy = points[i+1][1] - points[i][1]
-            seg_len = math.sqrt(dx*dx + dy*dy)
-            segment_lengths.append(seg_len)
-            total_length += seg_len
-        
-        if total_length < 1e-6:
-            # 如果路径长度为0，均匀分布点
-            interpolated = []
-            for i in range(target_count):
-                t = i / (target_count - 1) if target_count > 1 else 0.0
-                idx = int(t * (len(points) - 1))
-                idx = min(idx, len(points) - 1)
-                interpolated.append(points[idx])
-            return interpolated
-        
-        # 按路径长度比例插值
-        interpolated = []
-        for i in range(target_count):
-            t = i / (target_count - 1) if target_count > 1 else 0.0
-            target_distance = t * total_length
-            
-            # 找到目标距离所在的线段
-            current_distance = 0.0
-            for seg_idx in range(len(segment_lengths)):
-                if current_distance + segment_lengths[seg_idx] >= target_distance:
-                    # 在这个线段上
-                    seg_t = (target_distance - current_distance) / segment_lengths[seg_idx] if segment_lengths[seg_idx] > 0 else 0.0
-                    seg_t = max(0.0, min(1.0, seg_t))
-                    
-                    x = points[seg_idx][0] + seg_t * (points[seg_idx+1][0] - points[seg_idx][0])
-                    y = points[seg_idx][1] + seg_t * (points[seg_idx+1][1] - points[seg_idx][1])
-                    interpolated.append((x, y))
-                    break
-                
-                current_distance += segment_lengths[seg_idx]
-            else:
-                # 如果超出范围，使用最后一个点
-                interpolated.append(points[-1])
-        
-        return interpolated
-    
-    def _get_point_at_parameter(self, points, t):
-        """根据参数t (0-1) 在路径上找到对应的点"""
-        if len(points) == 0:
-            return (0.0, 0.0)
-        if len(points) == 1:
-            return points[0]
-        
-        # 计算路径的总长度
-        segment_lengths = []
-        total_length = 0.0
-        for i in range(len(points) - 1):
-            dx = points[i+1][0] - points[i][0]
-            dy = points[i+1][1] - points[i][1]
-            seg_len = math.sqrt(dx*dx + dy*dy)
-            segment_lengths.append(seg_len)
-            total_length += seg_len
-        
-        if total_length < 1e-6:
-            return points[0]
-        
-        # 找到目标距离
-        target_distance = t * total_length
-        
-        # 找到目标点所在的线段
-        current_distance = 0.0
-        for i in range(len(segment_lengths)):
-            if current_distance + segment_lengths[i] >= target_distance:
-                # 在这个线段上
-                seg_t = (target_distance - current_distance) / segment_lengths[i] if segment_lengths[i] > 0 else 0.0
-                seg_t = max(0.0, min(1.0, seg_t))
-                
-                x = points[i][0] + seg_t * (points[i+1][0] - points[i][0])
-                y = points[i][1] + seg_t * (points[i+1][1] - points[i][1])
-                return (x, y)
-            
-            current_distance += segment_lengths[i]
-        
-        # 如果超出范围，返回最后一个点
-        return points[-1]
+                    # 只保存起始点和终点
+                    self.centerlines[lanelet_id] = [(start_x, start_y), (end_x, end_y)]
     
     def build_topology_graph(self):
         """构建Lanelet拓扑连接图 - 优先使用lanelet2库的拓扑信息，然后使用空间匹配"""
         self.graph = defaultdict(list)
         self.lanelet_data = {}
         
-        # 使用空间匹配方法构建拓扑（与control-with-traffic-light.py相同）
-        self.get_logger().info("使用中心线端点空间匹配构建拓扑连接（与control-with-traffic-light.py相同）...")
-        
-        # 方法2：基于中心线端点空间匹配构建拓扑（补充）
-        self.get_logger().info("使用中心线端点空间匹配补充拓扑连接...")
-        
+        # 使用空间匹配方法构建拓扑
+        self.get_logger().info("使用中心线端点空间匹配构建拓扑连接...")        
         lanelet_ends = {}
         for lanelet_id, centerline in self.centerlines.items():
             if len(centerline) > 0:
@@ -495,7 +297,7 @@ class MapControlNode(Node):
                 end_point = centerline[-1]
                 lanelet_ends[lanelet_id] = (start_point, end_point)
         
-        connection_threshold = 5.0  # 5米阈值（参考control-with-traffic-light.py）
+        connection_threshold = 5.0  # 5米阈值
         spatial_connections = 0
         
         for lanelet1_id, (start1, end1) in lanelet_ends.items():
@@ -510,46 +312,14 @@ class MapControlNode(Node):
                     if lanelet2_id not in self.graph[lanelet1_id]:
                         self.graph[lanelet1_id].append(lanelet2_id)
                         spatial_connections += 1
-                    
-                    # 添加双向连接支持（参考control-with-traffic-light.py）
-                    # 检查反向连接：lanelet1的起点到lanelet2的终点
-                    dist_reverse = math.sqrt((start1[0] - end2[0])**2 + (start1[1] - end2[1])**2)
-                    if dist_reverse < connection_threshold:
-                        if lanelet1_id not in self.graph[lanelet2_id]:
-                            self.graph[lanelet2_id].append(lanelet1_id)
-                            spatial_connections += 1
-        
-        self.get_logger().info(f"空间匹配添加了 {spatial_connections} 个连接")
-        
-        # 确保所有有中心线的lanelet都在图中（即使没有连接）
-        for lanelet_id in self.centerlines.keys():
-            if lanelet_id not in self.graph:
-                self.graph[lanelet_id] = []  # 添加孤立节点
-        
-        # 统计孤立节点
-        isolated_nodes = [lid for lid in self.graph.keys() if len(self.graph[lid]) == 0]
-        if len(isolated_nodes) > 0:
-            self.get_logger().warn(f"发现 {len(isolated_nodes)} 个孤立节点（无邻居）: {isolated_nodes[:10]}")
-        
-        # 检查连通性：统计每个节点的入度和出度
-        in_degree = defaultdict(int)
-        for lanelet_id in self.graph.keys():
-            for neighbor in self.graph[lanelet_id]:
-                in_degree[neighbor] += 1
-        
-        # 找出只有出度没有入度的节点（可能是起点）
-        only_out = [lid for lid in self.graph.keys() if len(self.graph[lid]) > 0 and in_degree[lid] == 0]
-        # 找出只有入度没有出度的节点（可能是终点）
-        only_in = [lid for lid in self.graph.keys() if len(self.graph[lid]) == 0 and in_degree[lid] > 0]
-        
-        if len(only_out) > 0:
-            self.get_logger().info(f"发现 {len(only_out)} 个只有出度的节点（可能是起点）: {only_out[:5]}")
-        if len(only_in) > 0:
-            self.get_logger().info(f"发现 {len(only_in)} 个只有入度的节点（可能是终点）: {only_in[:5]}")
-        
-        total_edges = sum(len(neighbors) for neighbors in self.graph.values())
-        self.get_logger().info(f"拓扑图构建完成，包含 {len(self.graph)} 个节点，{total_edges} 条边")
-    
+                
+                # 检查反向连接：lanelet1的起点到lanelet2的终点
+                dist_reverse = math.sqrt((start1[0] - end2[0])**2 + (start1[1] - end2[1])**2)
+                if dist_reverse < connection_threshold:
+                    if lanelet1_id not in self.graph[lanelet2_id]:
+                        self.graph[lanelet2_id].append(lanelet1_id)
+                        spatial_connections += 1
+            
     def publish_map(self):
         """发布地图可视化markers到RViz2（使用lanelet2库）"""
         if self.lanelet_map is None:
@@ -726,7 +496,9 @@ class MapControlNode(Node):
         marker_array = MarkerArray()
         marker_id = 0
         
-        for lanelet_id, centerline in self.centerlines.items():
+        for lanelet_id in self.centerlines.items():
+            # 按需重新计算完整中心线用于可视化
+            centerline = self._compute_centerline_from_lanelet(lanelet_id)
             if len(centerline) < 2:
                 continue
             
@@ -803,24 +575,10 @@ class MapControlNode(Node):
         
         self.centerline_marker_pub.publish(marker_array)
     
-    def find_nearest_lanelet(self, x, y):
-        """找到离指定点最近的lanelet ID"""
-        min_dist = float('inf')
-        nearest_lanelet_id = None
-        
-        for lanelet_id, centerline in self.centerlines.items():
-            for point in centerline:
-                dist = math.sqrt((x - point[0])**2 + (y - point[1])**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_lanelet_id = lanelet_id
-        
-        return nearest_lanelet_id
     
     def astar_path_search(self, start_lanelet_id, goal_lanelet_id):
         """
         使用A*算法搜索从起点到终点的lanelet路径
-        参考control-with-traffic-light.py的简化实现
         """
         # 检查起点和终点是否在拓扑图中
         if start_lanelet_id not in self.graph:
@@ -846,7 +604,7 @@ class MapControlNode(Node):
             self.get_logger().error(f"❌ 起点lanelet {start_lanelet_id} 和终点lanelet {goal_lanelet_id} 不在同一个连通分量中！")
             return None, None
         
-        # 简化的启发式函数（参考control-with-traffic-light.py）
+        # 简化的启发式函数
         def heuristic(lanelet_id):
             if lanelet_id == goal_lanelet_id:
                 return 0.0
@@ -932,58 +690,33 @@ class MapControlNode(Node):
                         queue.append(neighbor)
         
         return False
+        
     
-    def find_nearest_connected_lanelet(self, lanelet_id):
-        """找到离指定lanelet最近的连通lanelet"""
-        if lanelet_id not in self.centerlines:
-            return None
+    def _compute_centerline_from_lanelet(self, lanelet_id):
+        """从lanelet的leftBound和rightBound计算完整中心线"""
+        # 在lanelet_map中找到对应的lanelet
+        lanelet_ = None
+        for ll in self.lanelet_map.laneletLayer:
+            if ll.id == lanelet_id:
+                lanelet_ = ll
+                break
         
-        target_centerline = self.centerlines[lanelet_id]
-        if len(target_centerline) == 0:
-            return None
+        if lanelet_ is None:
+            # self.get_logger().warn(f"未找到lanelet_id={lanelet_id}")
+            return []
         
-        # 使用中心线的中点作为参考点
-        mid_idx = len(target_centerline) // 2
-        target_point = target_centerline[mid_idx]
+        left_bound = [lanelet2.geometry.to2D(p) for p in lanelet_.leftBound]
+        right_bound = [lanelet2.geometry.to2D(p) for p in lanelet_.rightBound]
         
-        min_dist = float('inf')
-        nearest_connected_id = None
+        centerline = []
+        min_len = min(len(left_bound), len(right_bound))
         
-        for connected_id in self.graph.keys():
-            if connected_id == lanelet_id:
-                continue
-            if connected_id not in self.centerlines:
-                continue
-            
-            centerline = self.centerlines[connected_id]
-            if len(centerline) == 0:
-                continue
-            
-            # 计算到中心线最近点的距离
-            for point in centerline:
-                dist = math.sqrt((target_point[0] - point[0])**2 + (target_point[1] - point[1])**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_connected_id = connected_id
+        for i in range(min_len):
+            center_x = (left_bound[i].x + right_bound[i].x) / 2.0
+            center_y = (left_bound[i].y + right_bound[i].y) / 2.0
+            centerline.append((center_x, center_y))
         
-        if nearest_connected_id is not None and min_dist < 10.0:  # 10米内认为可连接
-            self.get_logger().info(f"找到最近的连通lanelet: {nearest_connected_id} (距离 {min_dist:.2f}m)")
-            return nearest_connected_id
-        
-        return None
-    
-    def find_nearest_point_index_in_centerline(self, x, y, centerline):
-        """找到centerline中最近点的索引"""
-        min_dist = float('inf')
-        nearest_idx = 0
-        
-        for idx, point in enumerate(centerline):
-            dist = math.sqrt((x - point[0])**2 + (y - point[1])**2)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = idx
-        
-        return nearest_idx
+        return centerline
     
     def point_to_line_distance(self, px, py, x1, y1, x2, y2):
         """计算点到线段的最短距离和最近点"""
@@ -1004,25 +737,16 @@ class MapControlNode(Node):
         return dist, (proj_x, proj_y)
     
     def find_nearest_centerline_point(self, x, y):
-        """找到离指定点最近的道路中心点（精确到线段）"""
+        """找到离指定点最近的道路中心点（精确到线段），返回最近点、距离和lanelet_id"""
         min_dist = float('inf')
         nearest_point = None
         nearest_lanelet_id = None
-        
-        # 先检查所有采样点
+                
+        # 检查每条中心线的线段（centerlines现在只保存起始点和终点）
         for lanelet_id, centerline in self.centerlines.items():
-            for point in centerline:
-                dist = math.sqrt((x - point[0])**2 + (y - point[1])**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_point = point
-                    nearest_lanelet_id = lanelet_id
-        
-        # 再检查每条中心线的线段（更精确）
-        for lanelet_id, centerline in self.centerlines.items():
-            for i in range(len(centerline) - 1):
-                p1 = centerline[i]
-                p2 = centerline[i + 1]
+            if len(centerline) >= 2:
+                p1 = centerline[0]
+                p2 = centerline[1]
                 
                 dist, proj_point = self.point_to_line_distance(
                     x, y, p1[0], p1[1], p2[0], p2[1]
@@ -1041,46 +765,8 @@ class MapControlNode(Node):
                 f"点击位置: ({x:.2f}, {y:.2f})，"
                 f"调整到: ({nearest_point[0]:.2f}, {nearest_point[1]:.2f})"
             )
-            
-            # 诊断：检查该lanelet的中心线信息
-            if nearest_lanelet_id in self.centerlines:
-                centerline = self.centerlines[nearest_lanelet_id]
-                if len(centerline) > 0:
-                    centerline_start = centerline[0]
-                    centerline_end = centerline[-1]
-                    centerline_length = 0.0
-                    for i in range(len(centerline) - 1):
-                        dx = centerline[i+1][0] - centerline[i][0]
-                        dy = centerline[i+1][1] - centerline[i][1]
-                        centerline_length += math.sqrt(dx*dx + dy*dy)
-                    
-                    self.get_logger().warn(
-                        f"   该lanelet中心线: 起点({centerline_start[0]:.2f}, {centerline_start[1]:.2f}), "
-                        f"终点({centerline_end[0]:.2f}, {centerline_end[1]:.2f}), "
-                        f"长度={centerline_length:.2f}m, 点数={len(centerline)}"
-                    )
-            
-            # 检查是否有更近的其他lanelet
-            distances_to_all = []
-            for lid, cl in self.centerlines.items():
-                if lid == nearest_lanelet_id:
-                    continue
-                for point in cl:
-                    dist = math.sqrt((x - point[0])**2 + (y - point[1])**2)
-                    distances_to_all.append((lid, dist))
-            
-            if distances_to_all:
-                distances_to_all.sort(key=lambda x: x[1])
-                second_closest = distances_to_all[0]
-                self.get_logger().warn(
-                    f"   第二近的lanelet: {second_closest[0]}, 距离={second_closest[1]:.2f}m"
-                )
-            
-            self.get_logger().warn(
-                f"💡 提示：请在RViz中点击时尽量靠近道路中心线，以减少自动调整的距离"
-            )
         
-        return nearest_point, min_dist
+        return nearest_point, min_dist, nearest_lanelet_id
     
     def odom_callback(self, msg: Odometry):
         """监听车辆速度，检测车辆停止后将当前位置设为新的起点"""
@@ -1173,7 +859,10 @@ class MapControlNode(Node):
             f"收到初始位置: 位置({pose.x:.2f}, {pose.y:.2f}), 偏航角: {math.degrees(yaw):.1f}°"
         )
         
-        nearest_point, distance = self.find_nearest_centerline_point(pose.x, pose.y)
+        nearest_point, distance, lanelet_id = self.find_nearest_centerline_point(pose.x, pose.y)
+        
+        # 保存起点的lanelet_id
+        self.start_lanelet_id = lanelet_id
         
         if nearest_point is None:
             self.get_logger().error("❌ 未找到道路中心线！可能的原因：")
@@ -1237,7 +926,10 @@ class MapControlNode(Node):
             f"收到目标点: 位置({pose.x:.2f}, {pose.y:.2f}), 偏航角: {math.degrees(yaw):.1f}°"
         )
         
-        nearest_point, distance = self.find_nearest_centerline_point(pose.x, pose.y)
+        nearest_point, distance, lanelet_id = self.find_nearest_centerline_point(pose.x, pose.y)
+        
+        # 保存终点的lanelet_id
+        self.goal_lanelet_id = lanelet_id
         
         if nearest_point is None:
             self.get_logger().error("❌ 未找到道路中心线！可能的原因：")
@@ -1303,6 +995,19 @@ class MapControlNode(Node):
         
         self.publish_vehicle_marker()
     
+    def _find_nearest_point_index_in_centerline(self, x, y, centerline):
+        """找到centerline中最近点的索引"""
+        min_dist = float('inf')
+        nearest_idx = 0
+        
+        for idx, point in enumerate(centerline):
+            dist = math.sqrt((x - point[0])**2 + (y - point[1])**2)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = idx
+        
+        return nearest_idx
+    
     def plan_path(self):
         """基于道路中心线拓扑规划路径 - 使用A*算法"""
         if self.current_pose is None or self.goal_pose is None:
@@ -1315,8 +1020,9 @@ class MapControlNode(Node):
         self.current_waypoint_index = 0
         self.path_published = False
         
-        start_lanelet_id = self.find_nearest_lanelet(start_pose.x, start_pose.y)
-        goal_lanelet_id = self.find_nearest_lanelet(goal_pose.x, goal_pose.y)
+        # 使用全局变量中的lanelet_id
+        start_lanelet_id = self.start_lanelet_id
+        goal_lanelet_id = self.goal_lanelet_id
         
         self.get_logger().info(f"🔍 起点lanelet: {start_lanelet_id}, 终点lanelet: {goal_lanelet_id}")
         
@@ -1362,30 +1068,39 @@ class MapControlNode(Node):
         self.waypoints = []
         self.waypoints.append((start_pose.x, start_pose.y))
         
+        # 按需从lanelet的leftBound/rightBound重新计算中心线
         for i, lanelet_id in enumerate(lanelet_path):
-            if lanelet_id in self.centerlines:
-                centerline = self.centerlines[lanelet_id]
-                direction = directions[i] if i < len(directions) else 'forward'
+            # 重新计算完整中心线
+            centerline = self._compute_centerline_from_lanelet(lanelet_id)
+            if len(centerline) == 0:
+                continue
                 
-                if direction == 'reverse':
-                    centerline = list(reversed(centerline))
-                
-                if i == 0:
-                    start_idx = self.find_nearest_point_index_in_centerline(
-                        start_pose.x, start_pose.y, centerline
-                    )
-                    for point in centerline[start_idx:]:
-                        self.waypoints.append(point)
-                elif i == len(lanelet_path) - 1:
-                    goal_idx = self.find_nearest_point_index_in_centerline(
-                        goal_pose.x, goal_pose.y, centerline
-                    )
-                    for point in centerline[:goal_idx]:
-                        self.waypoints.append(point)
-                else:
-                    self.waypoints.extend(centerline)
+            direction = directions[i] if i < len(directions) else 'forward'
+            
+            if direction == 'reverse':
+                centerline = list(reversed(centerline))
+            
+            if i == 0:
+                # 第一个lanelet：从起点位置开始
+                start_idx = self._find_nearest_point_index_in_centerline(
+                    start_pose.x, start_pose.y, centerline
+                )
+                for point in centerline[start_idx:]:
+                    self.waypoints.append(point)
+            elif i == len(lanelet_path) - 1:
+                # 最后一个lanelet：到终点位置结束
+                goal_idx = self._find_nearest_point_index_in_centerline(
+                    goal_pose.x, goal_pose.y, centerline
+                )
+                for point in centerline[:goal_idx + 1]:
+                    self.waypoints.append(point)
+            else:
+                # 中间lanelet：添加全部点
+                self.waypoints.extend(centerline)
         
         self.waypoints.append((goal_pose.x, goal_pose.y))
+        
+        self.waypoints = self._uniform_sample_path(self.waypoints)
         
         self.get_logger().info(f"路径规划完成，共生成 {len(self.waypoints)} 个路径点")
         
@@ -1396,19 +1111,34 @@ class MapControlNode(Node):
         self.waypoints = []
         self.waypoints.append((start_pose.x, start_pose.y))
         
-        if lanelet_id in self.centerlines:
-            centerline = self.centerlines[lanelet_id]
-            start_idx = self.find_nearest_point_index_in_centerline(
+        # 按需从lanelet的leftBound/rightBound重新计算中心线
+        centerline = self._compute_centerline_from_lanelet(lanelet_id)
+        
+        if len(centerline) > 0:
+            start_idx = self._find_nearest_point_index_in_centerline(
                 start_pose.x, start_pose.y, centerline
             )
-            goal_idx = self.find_nearest_point_index_in_centerline(
+            goal_idx = self._find_nearest_point_index_in_centerline(
                 goal_pose.x, goal_pose.y, centerline
             )
             
-            for i in range(start_idx, goal_idx):
-                self.waypoints.append(centerline[i])
+            # 确保索引顺序正确
+            if start_idx <= goal_idx:
+                for i in range(start_idx, goal_idx + 1):
+                    self.waypoints.append(centerline[i])
+            else:
+                # 如果start_idx > goal_idx，说明需要反向
+                for i in range(start_idx, -1, -1):
+                    self.waypoints.append(centerline[i])
+                for i in range(len(centerline) - 1, goal_idx - 1, -1):
+                    if i != start_idx:
+                        self.waypoints.append(centerline[i])
         
         self.waypoints.append((goal_pose.x, goal_pose.y))
+        
+        # 所有waypoints处理完成后，调用_uniform_sample_path进行均匀采样
+        self.waypoints = self._uniform_sample_path(self.waypoints)
+        
         self.publish_path()
     
     def plan_straight_line_path(self, start_pose, goal_pose):

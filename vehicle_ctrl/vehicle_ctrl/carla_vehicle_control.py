@@ -7,7 +7,7 @@ from rclpy.timer import Timer
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Int32
 from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus, CarlaEgoVehicleInfo
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from tf_transformations import euler_from_quaternion
@@ -37,10 +37,11 @@ class CarlaVehicleControl(Node):
         self.max_deceleration = -3.0
         
         # 初始化Stanley控制器
+        # 这里的k参数过小会导致横向位置偏差对前轮转角的影响小，k参数过大会导致对横向误差较为敏感，容易发生震荡
         self.stanley = StanleyController(
-            k=0.8,
+            k=6,
             epsilon=0.3,
-            max_steer=0.5,
+            max_steer=1.22,
             filter_alpha=0.2,
             lookahead_base=1.5,
             lookahead_gain=0.5
@@ -128,7 +129,6 @@ class CarlaVehicleControl(Node):
         self.last_control_input = np.array([0.0, 0.0])  # 上一次控制输入 [v, delta]
 
         # 油门刹车切换相关参数
-        self.prev_throttle = 0.3
         self.switch_threshold = 0.05
         
         # 路径曲率
@@ -216,6 +216,42 @@ class CarlaVehicleControl(Node):
                 '/vehicle_control/plot_data',
                 10
             )
+        
+        # 路径平滑相关发布器和订阅器
+        self.nearest_idx_pub = self.create_publisher(
+            Int32,
+            '/vehicle_control/nearest_idx',
+            10
+        )
+        
+        # 订阅路径增量更新
+        self.path_update_index_sub = self.create_subscription(
+            Int32,
+            '/path_smoothing/update_index',
+            self.path_update_index_callback,
+            10
+        )
+        
+        self.path_update_points_sub = self.create_subscription(
+            Path,
+            '/path_smoothing/update_points',
+            self.path_update_points_callback,
+            10
+        )
+        
+        # 状态变量：用于同步索引和点列表
+        self.pending_update_index = None
+        self.pending_update_points = None
+        
+        # 参考线发布相关
+        self.reference_path_pub = self.create_publisher(
+            Path,
+            '/vehicle_control/reference_path',
+            10
+        )
+        self.waypoint_interval = 0.5  # 路径点间隔 (m)，方便后续调整
+        self.reference_time_horizon = 5.0  # 参考线时间范围 (s)
+        self.reference_path_counter = 0  # 用于控制发布频率（每隔两个控制周期）
         
         # CARLA连接
         self.carla_client = None
@@ -520,7 +556,7 @@ class CarlaVehicleControl(Node):
             new_waypoints.append((x, y))
         
         # 路径降采样（间隔1米）
-        new_waypoints = self.downsample_path(new_waypoints, interval=0.5)
+        # new_waypoints = self.downsample_path(new_waypoints, interval=0.5)
         
         with self.data_lock:
             self.waypoints = new_waypoints
@@ -531,6 +567,51 @@ class CarlaVehicleControl(Node):
             self.path_curvatures = self.compute_curvatures(new_waypoints)
         
         self.get_logger().info(f"{CYAN}✓ 收到路径规划，包含 {len(new_waypoints)} 个路径点{RESET}")
+    
+    def path_update_index_callback(self, msg):
+        """路径更新索引回调"""
+        self.pending_update_index = msg.data
+        self._try_apply_path_update()
+    
+    def path_update_points_callback(self, msg):
+        """路径更新点列表回调"""
+        update_points = []
+        for pose in msg.poses:
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+            update_points.append((x, y))
+        
+        self.pending_update_points = update_points
+        self._try_apply_path_update()
+    
+    def _try_apply_path_update(self):
+        """尝试应用路径增量更新（需要同时收到索引和点列表）"""
+        if self.pending_update_index is None or self.pending_update_points is None:
+            return
+        
+        start_idx = self.pending_update_index
+        update_points = self.pending_update_points
+        
+        # 如果没有需要更新的点，跳过
+        if len(update_points) == 0:
+            self.pending_update_index = None
+            self.pending_update_points = None
+            return
+        
+        with self.data_lock:
+            # 局部更新waypoints
+            if start_idx >= 0 and start_idx < len(self.waypoints):
+                for i, point in enumerate(update_points):
+                    global_idx = start_idx + i
+                    if 0 <= global_idx < len(self.waypoints):
+                        self.waypoints[global_idx] = point
+                
+                # 重新计算路径曲率
+                # self.path_curvatures = self.compute_curvatures(self.waypoints)
+        
+        # 清除待处理状态
+        self.pending_update_index = None
+        self.pending_update_points = None
     
     def initialpose_callback(self, msg):
         """初始位置回调"""
@@ -645,6 +726,53 @@ class CarlaVehicleControl(Node):
         
         return float(planned_speed)
     
+    def publish_reference_path(self, waypoints, start_idx, current_speed):
+        """
+        发布车辆5秒内的参考线路径
+        
+        参数：
+        waypoints: 完整路径点列表
+        start_idx: 起始路径点索引（current_waypoint_index）
+        current_speed: 当前车辆速度 (m/s)
+        """
+        # 如果速度太小，不发布
+        if current_speed < 0.01:
+            return
+        
+        if len(waypoints) == 0 or start_idx < 0 or start_idx >= len(waypoints):
+            return
+        
+        # 计算5秒内行驶的距离
+        distance_5s = current_speed * self.reference_time_horizon
+        
+        # 根据路径点间隔计算需要显示的路径点数量
+        num_points_needed = int(distance_5s / self.waypoint_interval) + 1
+        
+        # 提取参考路径点（从start_idx开始）
+        end_idx = min(start_idx + num_points_needed, len(waypoints))
+        reference_waypoints = waypoints[start_idx:end_idx]
+        
+        # 如果没有路径点，不发布
+        if len(reference_waypoints) == 0:
+            return
+        
+        # 创建Path消息
+        path_msg = Path()
+        path_msg.header.frame_id = "map"
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        
+        for waypoint in reference_waypoints:
+            pose_stamped = PoseStamped()
+            pose_stamped.header = path_msg.header
+            pose_stamped.pose.position.x = float(waypoint[0])
+            pose_stamped.pose.position.y = float(waypoint[1])
+            pose_stamped.pose.position.z = 0.0
+            pose_stamped.pose.orientation.w = 1.0
+            path_msg.poses.append(pose_stamped)
+        
+        # 发布参考线
+        self.reference_path_pub.publish(path_msg)
+    
     def _update_error_visualization(self, cross_track_error, heading_error, normalized_steer=0.0, vehicle_speed=0.0, vehicle_accel=0.0, throttle=0.0, brake=0.0, speed_error=0.0, accel_error=0.0):
         """发布绘图数据到话题"""
         if not self.enable_plotting:
@@ -730,6 +858,17 @@ class CarlaVehicleControl(Node):
             )
 
             self.current_waypoint_index = nearest_idx
+            
+            # 发布最近路径点索引供路径平滑节点使用
+            nearest_idx_msg = Int32()
+            nearest_idx_msg.data = nearest_idx
+            self.nearest_idx_pub.publish(nearest_idx_msg)
+            
+            # 发布参考线（每隔两个控制周期发布一次）
+            self.reference_path_counter += 1
+            if self.reference_path_counter >= 2:
+                self.publish_reference_path(waypoints, nearest_idx, current_v)
+                self.reference_path_counter = 0
 
             # 速度规划
             planned_speed = self.plan_speed()
@@ -744,7 +883,8 @@ class CarlaVehicleControl(Node):
             accel_error = acceleration - self.measured_accel
             self.current_steer = steering_angle
 
-            
+            print(f"steering_angle: {steering_angle}")
+            print("--------------------------------")
             # 转换为油门/刹车
             # FIXME: 输出为动力学模型输出，但输入是运动学模型输入，需要转换
             brake = 0.0
@@ -753,7 +893,6 @@ class CarlaVehicleControl(Node):
                 brake = self.brake_controller.compute(-accel_error)
                 self.filtered_actual_brake = self.filter_alpha_brake * brake + (1 - self.filter_alpha_brake) * self.filtered_actual_brake
                 brake = self.filtered_actual_brake
-                #throttle = self.prev_throttle
                 throttle = self.throttle_controller.compute(accel_error) + 0.3
                 self.filtered_actual_throttle = self.filter_alpha_throttle * throttle + (1 - self.filter_alpha_throttle) * self.filtered_actual_throttle
                 throttle = self.filtered_actual_throttle
@@ -762,7 +901,6 @@ class CarlaVehicleControl(Node):
                 throttle = self.throttle_controller.compute(accel_error) + 0.3
                 self.filtered_actual_throttle = self.filter_alpha_throttle * throttle + (1 - self.filter_alpha_throttle) * self.filtered_actual_throttle
                 throttle = self.filtered_actual_throttle
-                self.prev_throttle = throttle
                 self.brake_controller.reset()
 
             # 发布控制命令

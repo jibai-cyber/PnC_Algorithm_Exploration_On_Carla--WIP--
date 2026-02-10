@@ -65,11 +65,11 @@
                     "id": "rgb_front_left",
                     "spawn_point": {
                         "x": 2.0,
-                        "y": -2.0,
+                        "y": 2.0,
                         "z": 2.0,
                         "roll": 0.0,
                         "pitch": 0.0,
-                        "yaw": -90.0
+                        "yaw": 90.0
                     },
                     "image_size_x": 800,
                     "image_size_y": 600,
@@ -80,11 +80,11 @@
                     "id": "rgb_front_right",
                     "spawn_point": {
                         "x": 2.0,
-                        "y": 2.0,
+                        "y": -2.0,
                         "z": 2.0,
                         "roll": 0.0,
                         "pitch": 0.0,
-                        "yaw": 90.0
+                        "yaw": -90.0
                     },
                     "image_size_x": 800,
                     "image_size_y": 600,
@@ -99,7 +99,7 @@
                         "z": 2.0,
                         "roll": 0.0,
                         "pitch": 0.0,
-                        "yaw": 90.0
+                        "yaw": -90.0
                     },
                     "image_size_x": 800,
                     "image_size_y": 600,
@@ -114,7 +114,7 @@
                         "z": 2.0,
                         "roll": 0.0,
                         "pitch": 0.0,
-                        "yaw": -90.0
+                        "yaw": 90.0
                     },
                     "image_size_x": 800,
                     "image_size_y": 600,

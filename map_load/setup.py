@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'resource'), glob('resource/*.osm')),
+        (os.path.join('share', package_name, 'msg'), glob('msg/*.msg')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'map_control_node = map_load.map_control:main',
+            'path_smoother_node = map_load.path_smoother:main',
         ],
     },
 )

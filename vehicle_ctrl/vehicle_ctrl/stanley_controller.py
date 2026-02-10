@@ -6,7 +6,7 @@ import numpy as np
 
 
 class StanleyController:
-    def __init__(self, k=0.8, epsilon=0.3, max_steer=0.5, 
+    def __init__(self, k=3.5, epsilon=0.3, max_steer=1.22, 
                  filter_alpha=0.2, lookahead_base=1.5, lookahead_gain=0.5, curvature_feedforward_gain=0.0):
         """
         Args:
@@ -43,7 +43,6 @@ class StanleyController:
         
         return interpolated_kappa
 
-    # FIXME: 第二段转弯处加完噪声会存在严重震荡
     def compute_steering(self, current_x, current_y, current_yaw, current_v, path, dt=0.05, wheelbase=2.8, path_curvatures=None, start_idx=0):
         """
         计算转向角（复用前视点线段信息，优化曲率插值）
@@ -53,9 +52,10 @@ class StanleyController:
             target_point: 目标点坐标
             cross_track_error: 横向误差
             curvature: 路径曲率 (1/m)
+            nearest_idx: 最近路径点索引
         """
         if len(path) < 3:
-            return 0.0, (current_x, current_y), 0.0, 0.0
+            return 0.0, (current_x, current_y), 0.0, 0.0, 0
         
         current_pos = np.array([current_x, current_y])
         
