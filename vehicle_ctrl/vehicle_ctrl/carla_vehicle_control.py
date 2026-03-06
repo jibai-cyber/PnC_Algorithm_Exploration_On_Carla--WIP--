@@ -562,10 +562,7 @@ class CarlaVehicleControl(Node):
             self.waypoints = new_waypoints
             
             self.current_waypoint_index = 0
-            
-            # 计算路径曲率
-            self.path_curvatures = self.compute_curvatures(new_waypoints)
-        
+                    
         self.get_logger().info(f"{CYAN}✓ 收到路径规划，包含 {len(new_waypoints)} 个路径点{RESET}")
     
     def path_update_index_callback(self, msg):
@@ -606,9 +603,6 @@ class CarlaVehicleControl(Node):
                     if 0 <= global_idx < len(self.waypoints):
                         self.waypoints[global_idx] = point
                 
-                # 重新计算路径曲率
-                # self.path_curvatures = self.compute_curvatures(self.waypoints)
-        
         # 清除待处理状态
         self.pending_update_index = None
         self.pending_update_points = None
@@ -859,11 +853,11 @@ class CarlaVehicleControl(Node):
 
             self.current_waypoint_index = nearest_idx
             
-            # 发布最近路径点索引供路径平滑节点使用
+            # 发布最近路径点索引供路径平滑与感知节点使用
             nearest_idx_msg = Int32()
             nearest_idx_msg.data = nearest_idx
             self.nearest_idx_pub.publish(nearest_idx_msg)
-            
+
             # 发布参考线（每隔两个控制周期发布一次）
             self.reference_path_counter += 1
             if self.reference_path_counter >= 2:
@@ -883,8 +877,6 @@ class CarlaVehicleControl(Node):
             accel_error = acceleration - self.measured_accel
             self.current_steer = steering_angle
 
-            print(f"steering_angle: {steering_angle}")
-            print("--------------------------------")
             # 转换为油门/刹车
             # FIXME: 输出为动力学模型输出，但输入是运动学模型输入，需要转换
             brake = 0.0
@@ -925,7 +917,7 @@ class CarlaVehicleControl(Node):
                 brake,
                 speed_error,
                 accel_error
-            )
+            )    
 
             # self.log_counter += 1
             
@@ -951,7 +943,7 @@ class CarlaVehicleControl(Node):
         # ====== Humble适配：定时器状态检查 ======
         # 1. 若定时器已存在且未取消，直接返回
         if self.control_timer is not None and not self.control_timer.is_canceled():
-            self.get_logger().warn("控制定时器已运行，无需重复创建")
+            # self.get_logger().warn("控制定时器已运行，无需重复创建")
             return
         
         # 重置控制状态

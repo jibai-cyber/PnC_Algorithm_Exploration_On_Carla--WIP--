@@ -57,7 +57,7 @@ class MapControlNode(Node):
         # 使用lanelet2库加载地图
         self.lanelet_map = None
         
-        # 地图发布器
+        # 地图和可视化发布器
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.map_publisher = self.create_publisher(MarkerArray, 'lanelet2_map', qos_profile)
@@ -116,9 +116,7 @@ class MapControlNode(Node):
         # 发布器
         self.status_pub = self.create_publisher(String, '/pose_status', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.vehicle_marker_pub = self.create_publisher(Marker, '/vehicle_marker', qos_profile)
         self.path_pub = self.create_publisher(Path, '/carla/ego_vehicle/waypoints', qos_profile)
-        self.waypoint_marker_pub = self.create_publisher(MarkerArray, '/waypoint_markers', qos_profile)
         self.adjusted_pose_pub = self.create_publisher(PoseStamped, '/adjusted_initialpose', 10)
         
         # 订阅车辆里程计
@@ -137,13 +135,8 @@ class MapControlNode(Node):
             100
         )
         
-        # 中心线可视化发布器
-        self.centerline_marker_pub = self.create_publisher(MarkerArray, '/centerlines', qos_profile)
-        
         # 定时器
         self.map_timer = self.create_timer(1.0, self.publish_map)  # 1Hz发布地图
-        self.centerline_timer = self.create_timer(1.0, self.publish_centerlines)  # 1Hz发布中心线
-        self.visualization_timer = self.create_timer(0.033, self.publish_visualization)  # 30Hz可视化
         
         self.get_logger().info("地图显示与路径规划控制器已启动")
         self.get_logger().info(f"地图已加载，包含 {len(self.centerlines)} 条中心线")
@@ -491,91 +484,6 @@ class MapControlNode(Node):
         
         self.map_publisher.publish(marker_array)
     
-    def publish_centerlines(self):
-        """发布所有中心线到RViz2用于可视化诊断"""
-        marker_array = MarkerArray()
-        marker_id = 0
-        
-        for lanelet_id in self.centerlines.items():
-            # 按需重新计算完整中心线用于可视化
-            centerline = self._compute_centerline_from_lanelet(lanelet_id)
-            if len(centerline) < 2:
-                continue
-            
-            # 创建中心线marker
-            centerline_marker = Marker()
-            centerline_marker.header.frame_id = "map"
-            centerline_marker.header.stamp = self.get_clock().now().to_msg()
-            centerline_marker.type = Marker.LINE_STRIP
-            centerline_marker.action = Marker.ADD
-            centerline_marker.scale.x = 0.2  # 线宽
-            centerline_marker.color.a = 0.8
-            centerline_marker.color.r = 1.0  # 红色中心线
-            centerline_marker.color.g = 0.0
-            centerline_marker.color.b = 1.0
-            centerline_marker.ns = "centerlines"
-            centerline_marker.id = marker_id
-            centerline_marker.lifetime.sec = 0  # 永久显示
-            
-            # 添加中心线点
-            for point in centerline:
-                centerline_marker.points.append(Point(x=point[0], y=point[1], z=0.1))
-            
-            if len(centerline_marker.points) > 0:
-                marker_array.markers.append(centerline_marker)
-                marker_id += 1
-            
-            # 为每个中心线的起点和终点添加标记
-            if len(centerline) > 0:
-                # 起点标记（绿色）
-                start_marker = Marker()
-                start_marker.header.frame_id = "map"
-                start_marker.header.stamp = self.get_clock().now().to_msg()
-                start_marker.type = Marker.SPHERE
-                start_marker.action = Marker.ADD
-                start_marker.scale.x = 0.5
-                start_marker.scale.y = 0.5
-                start_marker.scale.z = 0.5
-                start_marker.color.a = 1.0
-                start_marker.color.r = 0.0
-                start_marker.color.g = 1.0
-                start_marker.color.b = 0.0
-                start_marker.ns = "centerline_starts"
-                start_marker.id = marker_id
-                start_marker.pose.position.x = centerline[0][0]
-                start_marker.pose.position.y = centerline[0][1]
-                start_marker.pose.position.z = 0.2
-                start_marker.pose.orientation.w = 1.0
-                start_marker.lifetime.sec = 0
-                marker_array.markers.append(start_marker)
-                marker_id += 1
-                
-                # 终点标记（蓝色）
-                end_marker = Marker()
-                end_marker.header.frame_id = "map"
-                end_marker.header.stamp = self.get_clock().now().to_msg()
-                end_marker.type = Marker.SPHERE
-                end_marker.action = Marker.ADD
-                end_marker.scale.x = 0.5
-                end_marker.scale.y = 0.5
-                end_marker.scale.z = 0.5
-                end_marker.color.a = 1.0
-                end_marker.color.r = 0.0
-                end_marker.color.g = 0.0
-                end_marker.color.b = 1.0
-                end_marker.ns = "centerline_ends"
-                end_marker.id = marker_id
-                end_marker.pose.position.x = centerline[-1][0]
-                end_marker.pose.position.y = centerline[-1][1]
-                end_marker.pose.position.z = 0.2
-                end_marker.pose.orientation.w = 1.0
-                end_marker.lifetime.sec = 0
-                marker_array.markers.append(end_marker)
-                marker_id += 1
-        
-        self.centerline_marker_pub.publish(marker_array)
-    
-    
     def astar_path_search(self, start_lanelet_id, goal_lanelet_id):
         """
         使用A*算法搜索从起点到终点的lanelet路径
@@ -794,9 +702,6 @@ class MapControlNode(Node):
                         self.current_waypoint_index = 0
                         self.path_published = False
                         
-                        self.clear_waypoint_markers()
-                        self.publish_vehicle_marker()
-                        
                         self.get_logger().info("🚦 车辆已停止：已将当前位置设为新的起点，請在 RViz2 重新设置新的终点。")
                         self._stopped_since = now + 9999.0
             else:
@@ -841,8 +746,6 @@ class MapControlNode(Node):
             self.current_waypoint_index = 0
             self.path_published = False
 
-            self.clear_waypoint_markers()
-            self.publish_vehicle_marker()
             self.get_logger().info("📍 捕捉到 simple_ctrl 停止位姿，已更新起点；请在 RViz2 重新设置新的终点。")
         except Exception:
             pass
@@ -913,7 +816,6 @@ class MapControlNode(Node):
         
         self.spawn_vehicle_at_current_pose(adjusted_pose)
         self.publish_status("initial_pose_received")
-        # self.publish_vehicle_marker()
     
     def goal_pose_callback(self, msg):
         """处理目标点回调 - 自动调整到道路中心线"""
@@ -976,7 +878,6 @@ class MapControlNode(Node):
         if self.vehicle_spawned:
             self.plan_path()
             self.publish_status("goal_pose_received")
-            self.publish_waypoint_markers()
         else:
             self.get_logger().warn("请先设置初始位置生成自车")
     
@@ -992,8 +893,6 @@ class MapControlNode(Node):
         self.get_logger().info("🚗 自车（Tesla Model3）已在当前位置生成")
         self.get_logger().info(f"自车位置: ({pose.position.x:.2f}, {pose.position.y:.2f}), z={pose.position.z:.2f}")
         self.get_logger().info("等待目标点设置...")
-        
-        self.publish_vehicle_marker()
     
     def _find_nearest_point_index_in_centerline(self, x, y, centerline):
         """找到centerline中最近点的索引"""
@@ -1162,63 +1061,6 @@ class MapControlNode(Node):
         self.waypoints.append((goal_pose.x, goal_pose.y))
         self.publish_path()
     
-    def publish_visualization(self):
-        """发布可视化信息"""
-        if self.vehicle_spawned:
-            self.publish_vehicle_marker()
-        if self.waypoints:
-            self.publish_path()
-            self.publish_waypoint_markers()
-    
-    def publish_vehicle_marker(self):
-        """发布车辆标记"""
-        if not self.vehicle_spawned or self.current_pose is None:
-            return
-            
-        marker = Marker()
-        marker.header.frame_id = "map"
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "vehicle"
-        marker.id = 0
-        marker.type = Marker.CUBE
-        marker.action = Marker.ADD
-        
-        marker.pose = self.current_pose
-        marker.scale.x = 4.7
-        marker.scale.y = 2.0
-        marker.scale.z = 1.4
-        
-        marker.color.r = 0.9
-        marker.color.g = 0.1
-        marker.color.b = 0.1
-        marker.color.a = 0.9
-        
-        marker.lifetime.sec = 0
-        
-        self.vehicle_marker_pub.publish(marker)
-        
-        arrow_marker = Marker()
-        arrow_marker.header.frame_id = "map"
-        arrow_marker.header.stamp = self.get_clock().now().to_msg()
-        arrow_marker.ns = "vehicle_direction"
-        arrow_marker.id = 1
-        arrow_marker.type = Marker.ARROW
-        arrow_marker.action = Marker.ADD
-        
-        arrow_marker.pose = self.current_pose
-        arrow_marker.scale.x = 3.0
-        arrow_marker.scale.y = 0.3
-        arrow_marker.scale.z = 0.3
-        
-        arrow_marker.color.r = 1.0
-        arrow_marker.color.g = 1.0
-        arrow_marker.color.b = 0.0
-        arrow_marker.color.a = 0.8
-        
-        arrow_marker.lifetime.sec = 0
-        
-        self.vehicle_marker_pub.publish(arrow_marker)
-    
     def publish_path(self):
         """发布规划路径，包含正确的方向信息（只发布一次）"""
         if self.path_published or not self.waypoints:
@@ -1254,87 +1096,6 @@ class MapControlNode(Node):
         self.path_pub.publish(path)
         self.path_published = True
         self.get_logger().info(f'✓ 发布路径到 /carla/ego_vehicle/waypoints，包含 {len(self.waypoints)} 个点')
-    
-    def clear_waypoint_markers(self):
-        """清除waypoint markers"""
-        delete_array = MarkerArray()
-        delete_marker = Marker()
-        delete_marker.header.frame_id = "map"
-        delete_marker.header.stamp = self.get_clock().now().to_msg()
-        delete_marker.ns = "waypoints"
-        delete_marker.action = Marker.DELETEALL
-        delete_array.markers.append(delete_marker)
-        self.waypoint_marker_pub.publish(delete_array)
-    
-    def publish_waypoint_markers(self):
-        """发布路径点标记"""
-        if not self.waypoints:
-            self.clear_waypoint_markers()
-            return
-        
-        marker_array = MarkerArray()
-        
-        display_indices = set()
-        
-        for i in range(0, len(self.waypoints), self.waypoint_display_interval):
-            display_indices.add(i)
-        
-        if 0 <= self.current_waypoint_index < len(self.waypoints):
-            display_indices.add(self.current_waypoint_index)
-        
-        if len(self.waypoints) > 0:
-            display_indices.add(0)
-            display_indices.add(len(self.waypoints) - 1)
-        
-        for i in sorted(display_indices):
-            if i >= len(self.waypoints):
-                continue
-                
-            waypoint = self.waypoints[i]
-            marker = Marker()
-            marker.header.frame_id = "map"
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "waypoints"
-            marker.id = i
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            
-            marker.pose.position.x = waypoint[0]
-            marker.pose.position.y = waypoint[1]
-            marker.pose.position.z = 0.0
-            marker.pose.orientation.w = 1.0
-            
-            marker.scale.x = 0.4
-            marker.scale.y = 0.4
-            marker.scale.z = 0.4
-            
-            if i == self.current_waypoint_index:
-                marker.color.r = 1.0
-                marker.color.g = 0.0
-                marker.color.b = 0.0
-            elif i == 0:
-                marker.color.r = 0.0
-                marker.color.g = 0.0
-                marker.color.b = 1.0
-            elif i == len(self.waypoints) - 1:
-                marker.color.r = 1.0
-                marker.color.g = 0.0
-                marker.color.b = 1.0
-            elif i < self.current_waypoint_index:
-                marker.color.r = 0.5
-                marker.color.g = 0.5
-                marker.color.b = 0.5
-            else:
-                marker.color.r = 0.0
-                marker.color.g = 1.0
-                marker.color.b = 0.0
-                
-            marker.color.a = 0.8
-            marker.lifetime.sec = 3
-            
-            marker_array.markers.append(marker)
-        
-        self.waypoint_marker_pub.publish(marker_array)
     
     def quaternion_to_yaw(self, quat):
         """将四元数转换为偏航角"""

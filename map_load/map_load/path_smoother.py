@@ -11,7 +11,7 @@
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, Header, Float64
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
@@ -19,6 +19,7 @@ import numpy as np
 import scipy.sparse as sp
 import time
 import osqp
+from map_load import math_utils
 
 
 class PathSmootherNode(Node):
@@ -36,7 +37,7 @@ class PathSmootherNode(Node):
         # 点间距（已知）
         self.point_spacing = 1  # 米
         
-        # 前向/后向距离参数（参考Apollo）
+        # 前向/后向距离参数
         self.look_forward_time_sec = 8.0  # 秒
         self.look_forward_short_distance = 180.0  # 米
         self.look_backward_distance = 50.0  # 米
@@ -58,6 +59,7 @@ class PathSmootherNode(Node):
         self.nearest_idx_received = False
         self.velocity_received = False
         
+        
         # 订阅器
         self.waypoints_sub = self.create_subscription(
             Path,
@@ -77,6 +79,15 @@ class PathSmootherNode(Node):
             Odometry,
             '/carla/ego_vehicle/odometry',
             self.odometry_callback,
+            10
+        )
+        
+        # 订阅位置调整话题（用于清空Marker显示）
+        from geometry_msgs.msg import PoseStamped
+        self.adjusted_pose_sub = self.create_subscription(
+            PoseStamped,
+            '/adjusted_initialpose',
+            self.adjusted_pose_callback,
             10
         )
         
@@ -148,9 +159,41 @@ class PathSmootherNode(Node):
         self.current_velocity = abs(linear_velocity)  # 取绝对值
         self.velocity_received = True
     
+    def adjusted_pose_callback(self, msg):
+        """位置调整回调：清空所有路径点Marker显示"""
+        try:
+            # 发布DELETEALL Marker到两个话题，清空所有显示
+            current_time = self.get_clock().now().to_msg()
+            
+            # 清空原始路径点Marker
+            delete_marker_original = Marker()
+            delete_marker_original.header.frame_id = "map"
+            delete_marker_original.header.stamp = current_time
+            delete_marker_original.action = Marker.DELETEALL
+            marker_array_original = MarkerArray()
+            marker_array_original.markers.append(delete_marker_original)
+            self.original_waypoints_marker_pub.publish(marker_array_original)
+            
+            # 清空平滑后路径点Marker
+            delete_marker_smoothed = Marker()
+            delete_marker_smoothed.header.frame_id = "map"
+            delete_marker_smoothed.header.stamp = current_time
+            delete_marker_smoothed.action = Marker.DELETEALL
+            marker_array_smoothed = MarkerArray()
+            marker_array_smoothed.markers.append(delete_marker_smoothed)
+            self.smoothed_waypoints_marker_pub.publish(marker_array_smoothed)
+            
+            # 重置Marker ID计数器
+            self.original_marker_id_counter = 0
+            self.smoothed_marker_id_counter = 0
+            
+            self.get_logger().info("已清空所有路径点Marker显示")
+        except Exception as e:
+            self.get_logger().warn(f"清空路径点Marker失败: {e}")
+    
     def calculate_look_forward_distance(self, velocity):
         """
-        计算前向距离（参考Apollo的LookForwardDistance）
+        计算前向距离
         
         参数：
         velocity: 车辆速度 (m/s)
@@ -472,18 +515,19 @@ class PathSmootherNode(Node):
         # 第一次平滑：没有重叠区域
         if last_nearest_idx < 0:
             start_idx = max(0, nearest_idx - backward_idx)
-            end_idx = min(n, nearest_idx + forward_idx + 1)
+            end_idx = min(n - 1, nearest_idx + forward_idx)
             
             # 确保至少3个点
-            if end_idx - start_idx < 3:
+            if end_idx - start_idx < 2:  # inclusive: 需要至少2个索引差（3个点）
                 if start_idx == 0:
-                    end_idx = min(n, start_idx + 3)
-                elif end_idx == n:
-                    start_idx = max(0, end_idx - 3)
+                    end_idx = min(n - 1, start_idx + 2)
+                elif end_idx >= n - 1:
+                    start_idx = max(0, n - 3)
+                    end_idx = n - 1
                 else:
-                    end_idx = min(n, start_idx + 3)
+                    end_idx = min(n - 1, start_idx + 2)
             
-            local_segment = waypoints[start_idx:end_idx]
+            local_segment = waypoints[start_idx:end_idx + 1]
             is_end_point = (end_idx >= n - 1)
             
             # 第一次平滑没有重叠区域，所有点都是新区域
@@ -501,9 +545,9 @@ class PathSmootherNode(Node):
         # 使用保存的上次平滑结束索引
         if self.last_smooth_end_idx < 0:
             # 如果没有保存，则基于last_nearest_idx估算（向后兼容）
-            last_smooth_end_idx = last_nearest_idx + forward_idx
+            last_smooth_end_idx = min(n - 1, last_nearest_idx + forward_idx)
         else:
-            last_smooth_end_idx = self.last_smooth_end_idx
+            last_smooth_end_idx = min(n - 1, self.last_smooth_end_idx)
         
         # 计算重叠区域（从上次平滑的末尾向前）
         overlap_start_idx = max(0, last_smooth_end_idx - overlap_idx)
@@ -539,9 +583,9 @@ class PathSmootherNode(Node):
         # 判断是否包含终点
         is_end_point = (new_region_end_idx >= n - 1)
         
-        # 计算在完整路径中的范围
+        # 计算在完整路径中的范围（end_idx是inclusive的，包含最后一个元素）
         start_idx = overlap_start_idx
-        end_idx = new_region_end_idx + 1
+        end_idx = new_region_end_idx
         
         return local_segment, start_idx, end_idx, overlap_indices, new_region_indices, True, is_end_point
     
@@ -571,7 +615,7 @@ class PathSmootherNode(Node):
             return
         
         # 保存本次平滑的结束索引（用于下次增量平滑）
-        self.last_smooth_end_idx = end_idx - 1  # end_idx是exclusive的，所以减1
+        self.last_smooth_end_idx = end_idx  # end_idx是inclusive的，直接保存
         
         # 执行平滑
         smoothed_segment = self.smooth_local_path(
@@ -649,6 +693,7 @@ class PathSmootherNode(Node):
         
         # 发布更新的路径点Marker到RViz
         self.publish_waypoints_markers(points_to_update, is_initial=False)
+        
     
     def publish_waypoints_markers(self, waypoints, is_initial=False):
         """
@@ -737,6 +782,7 @@ class PathSmootherNode(Node):
         
         # 发布到对应的话题
         publisher.publish(marker_array)
+    
 
 
 def main(args=None):

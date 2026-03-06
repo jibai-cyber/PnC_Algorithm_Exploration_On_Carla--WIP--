@@ -300,6 +300,42 @@
                     "id": "control"
                 }
             ]
+        },
+        {
+            "type": "vehicle.tesla.model3",
+            "id": "static_vehicle_1",
+            "spawn_point": {
+                "x": 340.838,
+                "y": -152.044,
+                "z": 0.5,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": -3.2
+            }
+        },
+        {
+            "type": "vehicle.audi.tt",
+            "id": "static_vehicle_2",
+            "spawn_point": {
+                "x": 336.38,
+                "y": -153.50,
+                "z": 0.5,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": -68.2
+            }
+        },
+        {
+            "type": "vehicle.nissan.patrol",
+            "id": "static_vehicle_3",
+            "spawn_point": {
+                "x": 287.33,
+                "y": -194.94,
+                "z": 0.5,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 175.2
+            }
         }
     ]
 }

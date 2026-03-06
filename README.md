@@ -6,6 +6,7 @@ See updated_version.txt
 > https://carla.readthedocs.io/projects/ros-bridge/en/latest/  
 > https://autowarefoundation.github.io/autoware-documentation/main/tutorials/  
 > https://github.com/fzi-forschungszentrum-informatik/Lanelet2/  
+> https://github.com/ApolloAuto/apollo/  
 
 ---
 
@@ -20,7 +21,7 @@ cd carla0914/
 ./CarlaUE4.sh 
 ```
 
-# Terminal 2, activate conda env, load carla-ros-bridge
+# Terminal 2, load carla-ros-bridge
 ```bash
 source ~/carla-ros-bridge/catkin_ws/install/setup.bash
 ros2 launch carla_ros_bridge carla_ros_bridge.launch.py synchronous_mode:=True town:=Town01
@@ -52,21 +53,15 @@ ros2 run vehicle_ctrl remap_goal
 rviz2 -d src/vehicle_ctrl/rviz2/carla_map_spawn_anywherev2.rviz 
 ```
 
-# Terminal 7, open control node
+# Terminal 7, open control/smooth/perception node
 ```bash
 source ~/ws/install/setup.bash 
-source ~/carla-ros-bridge/catkin_ws/setup.bash
-ros2 run vehicle_ctrl simple_ctrl 
+source ~/carla-ros-bridge/catkin_ws/install/setup.bash
+ros2 launch vehicle_ctrl full_system.launch.py
 ```
 
-# Terminal 8, open the plotter of controller
+# Terminal 8, open the plotter
 ```bash
 source ~/ws/install/setup.bash 
 ros2 run vehicle_ctrl vehicle_plotter
-```
-
-# Terminal 9, open path smoother
-```bash
-source ~/ws/install/setup.bash 
-ros2 run map_load path_smoother_node
 ```
