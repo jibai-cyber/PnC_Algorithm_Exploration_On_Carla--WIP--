@@ -126,3 +126,49 @@ TODO:
    - 初始化数据写进config文件
    - 采用log取代print打印日志，否则用launch启动多节点打印日志会阻塞线程
    - 尽可能采用launch启动所需节点
+
+
+---
+version 2.2
+1. 静态避障路径规划
+   - 确定凸空间（PathBoudary）：结合obs边界和道路边界进行初步拓展，再由 ADC_bound 和 lat_buffer 对凸空间进行收缩，
+     收缩后判断可通行性，如果边界收缩后不可通行，则会在阻塞区前10m停车，防止在较远处感知边缘box形状畸变导致的误判
+
+   - 通过obs的绕行决策提取obs指定角点取代AABB法，obs边界贴合自身几何形状
+
+   - FrenetQPPlanner约束条件：分段 jerk QP，约束含边界、曲率、jerk、连续性、初始状态、ego 四角点。
+     其中ego角点约束用的是收缩前的PathBoudary，防止约束过于严苛
+
+   - carla_vehicle_control逻辑优化（原先逻辑为跟踪 path_smoother 平滑后的参考线）：
+     优先跟踪 QP 局部路径，参考线仅作为坐标转换的参考系和最次解；
+     采用双索引（ref_nearest_idx / traj_nearest_idx）将局部路径与参考线解耦
+
+   - _check_path_reusable：根据obs更新情况和ego与上一周期的位置偏差判断是否复用QP局部路径，减小算力开销。
+     需要与复用的QP轨迹对齐，更新时由上一次复用的QP轨迹获取(l_init, dl_init, ddl_init)三个初始值，供新QP的起点约束使用
+
+   - 仅由复用QP插值得到的(l_init, dl_init, ddl_init)估计值可能不准确（并非复用QP求得的原始点），
+     所以可能复用QP可以得到的解，在新的QP求解中就因初始点约束太过严格（最初为等式约束）且速度、参考线曲率发生一定变化，
+     导致其与其它约束（比如角点约束、曲率约束）产生冲突，有概率会求解失败（失败大多存在于经过obs时）
+     所以当前起始点约束采用的是软约束，允许极小范围的偏差调整，能极大降低求解失败概率（数十次测试下，由原本的10%到0%）。
+
+   - 修正 PathBoundary 逻辑：@map_load/map_load/vehicle_perception.py:912-915，修正错画边界的逻辑
+
+   - vehicle_plotter：s-l 图绘制 PathBoundary 与 QP 路径
+
+   
+
+TODO:
+1. 当前obs的绕行决策完全由人为定义，Apollo当前采用重决策，逻辑较为冗杂，难以解耦出合适的状态机。
+   dp轻决策方案被Apollo弃用，粗浅分析为对于不同场景，横纵向撒点步长等参数难以统一。
+   网上有讨论反馈说高速路段仿真效果尚可，城市路段不佳
+   后续考虑采用iLQR或APF代替Apollo的dp方案实现轻决策
+2. 动态obs处理，速度规划与避障结合（遇障减速、停车决策）
+3. version 1.2/2.1 遗留：U-turn 处航向/横向误差震荡、Stanley 前视点优化、LQR 替代等
+4. 代码结构：PathBoundary/QP 参数进 config 
+5. 因为正常行驶时不太可能严格按照规划的轨迹行驶（控制器上限）,
+   所以(l_init, dl_init, ddl_init)并不能完全信任估计值，后续需要结合传感器(IMU, odometry)进行卡尔曼滤波
+   这样才能严格在ego处开始进行规划，提升规划精度
+6. 改进 QP 的cost函数，使得其尽可能的贴着凸空间的中心线行驶（当前设计是使其尽可能贴近参考线，
+   导致当obs侵入参考线时，规划的轨迹都是贴合obs边界的），提升规划路径的安全性
+7. (optional) 增强 PathBoundary 的复用率。
+8. 降低 vehicle_perception.py 代码的圈复杂度，增强可读性

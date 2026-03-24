@@ -26,6 +26,7 @@ def compute_path_profile(xy_points: np.ndarray, point_spacing: float = 1.0) -> T
     dkappas: (n,) 曲率变化率数组（1/米²）
     """
     n = len(xy_points)
+    seg_len_flag = False
     if n < 2:
         return np.array([]), np.array([]), np.array([]), np.array([])
     
@@ -47,12 +48,16 @@ def compute_path_profile(xy_points: np.ndarray, point_spacing: float = 1.0) -> T
     # 计算航向角
     headings = np.arctan2(dys, dxs)
     
-    # 计算累积弧长（使用定值ds优化计算）
+    # 累积弧长：优先使用真实欧氏距离，退化为 point_spacing（当点距过小/退化时）
     accumulated_s = np.zeros(n)
     accumulated_s[0] = 0.0
-
     for i in range(1, n):
-        accumulated_s[i] = accumulated_s[i-1] + point_spacing
+        seg_len = np.sqrt(
+            (xy_points[i, 0] - xy_points[i-1, 0])**2 + (xy_points[i, 1] - xy_points[i-1, 1])**2
+        )
+        if seg_len < 1e-4:
+            seg_len_flag = True
+        accumulated_s[i] = accumulated_s[i-1] + (seg_len if seg_len > 1e-4 else point_spacing)
     
     # 计算 x 和 y 对 s 的一阶导数
     x_over_s_first_derivatives = np.zeros(n)
@@ -104,8 +109,9 @@ def compute_path_profile(xy_points: np.ndarray, point_spacing: float = 1.0) -> T
         xdds = x_over_s_second_derivatives[i]
         ydds = y_over_s_second_derivatives[i]
         
-        denominator = np.sqrt(xds * xds + yds * yds) * (xds * xds + yds * yds) + 1e-6
-        kappas[i] = (xds * ydds - yds * xdds) / denominator
+        speed_sq = xds * xds + yds * yds
+        denominator = max(np.sqrt(speed_sq) * max(speed_sq, 1e-8) + 1e-8, 1e-6)
+        kappas[i] = np.clip((xds * ydds - yds * xdds) / denominator, -10.0, 10.0)
     
     # 计算曲率变化率
     dkappas = np.zeros(n)
@@ -123,7 +129,7 @@ def compute_path_profile(xy_points: np.ndarray, point_spacing: float = 1.0) -> T
             if ds > 1e-6:
                 dkappas[i] = (kappas[i + 1] - kappas[i - 1]) / ds
     
-    return headings, accumulated_s, kappas, dkappas
+    return headings, accumulated_s, kappas, dkappas, seg_len_flag
 
 
 def cartesian_to_frenet_simple(

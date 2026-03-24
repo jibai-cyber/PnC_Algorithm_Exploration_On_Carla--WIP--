@@ -43,10 +43,12 @@ class StanleyController:
         
         return interpolated_kappa
 
-    def compute_steering(self, current_x, current_y, current_yaw, current_v, path, dt=0.05, wheelbase=2.8, path_curvatures=None, start_idx=0):
+    def compute_steering(self, current_x, current_y, current_yaw, current_v, path, dt=0.05, wheelbase=2.8, start_idx=0, forward_only=False):
         """
         计算转向角（复用前视点线段信息，优化曲率插值）
-        
+
+        Args:
+            forward_only: 若为 True，路径仅含前方点（如 qp_path），不向后搜索
         Returns:
             steering_angle: 转向角 (rad)
             target_point: 目标点坐标
@@ -59,7 +61,7 @@ class StanleyController:
         
         current_pos = np.array([current_x, current_y])
         
-        # 1. 找到最近路径段（原有逻辑）
+        # 1. 找到最近路径段
         min_dist = float('inf')
         nearest_idx = 0
         target_point = path[0]
@@ -68,10 +70,13 @@ class StanleyController:
         nearest_seg_len = None
         nearest_seg_unitvec = None
 
-
-        # TODO: 优化查找最近路径段
-        min_search_idx = max(0, start_idx - 50)
-        max_search_idx = min(len(path)-1, start_idx + 50)
+        # 前向路径（如 qp_path）无后方点，只从 start_idx 向前搜索；否则前后各 50 点
+        if forward_only:
+            min_search_idx = max(0, start_idx)
+            max_search_idx = min(len(path) - 1, start_idx + 30)
+        else:
+            min_search_idx = max(0, start_idx - 50)
+            max_search_idx = min(len(path) - 1, start_idx + 50)
         for i in range(min_search_idx, max_search_idx):
             start_point = np.array(path[i])
             end_point = np.array(path[i + 1])
@@ -125,4 +130,4 @@ class StanleyController:
         steering_angle = np.clip(steer_correction, -self.max_steer, self.max_steer)
         
         
-        return steering_angle, (float(lookahead_point[0]), float(lookahead_point[1])), cross_track_error, curvature, nearest_idx
+        return steering_angle, (float(lookahead_point[0]), float(lookahead_point[1])), heading_error, cross_track_error, curvature, nearest_idx

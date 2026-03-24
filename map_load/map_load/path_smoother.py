@@ -186,8 +186,17 @@ class PathSmootherNode(Node):
             # 重置Marker ID计数器
             self.original_marker_id_counter = 0
             self.smoothed_marker_id_counter = 0
+
+            # 位置调整后清空旧路径与增量平滑状态
+            self.current_waypoints = []
+            self.waypoints_received = False
+            self.last_nearest_idx = -1
+            self.last_smooth_end_idx = -1
+            self.last_smooth_time = 0.0
+            self.current_nearest_idx = 0
+            self.nearest_idx_received = False
             
-            self.get_logger().info("已清空所有路径点Marker显示")
+            self.get_logger().info("已清空路径点 Marker 与平滑节点内部路径/增量状态")
         except Exception as e:
             self.get_logger().warn(f"清空路径点Marker失败: {e}")
     

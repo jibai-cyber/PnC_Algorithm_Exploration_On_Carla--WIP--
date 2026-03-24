@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FrenetPath.msg"
   "msg/SLBoundary.msg"
   "msg/SLBoundaryArray.msg"
+  "msg/PathBoundary.msg"
   DEPENDENCIES std_msgs
 )
 

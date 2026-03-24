@@ -12,12 +12,14 @@ import rclpy
 from rclpy.node import Node
 from rclpy.timer import Timer
 from std_msgs.msg import Float64MultiArray
+from nav_msgs.msg import Path
 try:
-    from map_load.msg import FrenetPath, SLBoundary, SLBoundaryArray
+    from map_load.msg import FrenetPath, SLBoundary, SLBoundaryArray, PathBoundary
 except ImportError:
     FrenetPath = None
     SLBoundary = None
     SLBoundaryArray = None
+    PathBoundary = None
 import matplotlib
 matplotlib.use('TkAgg')  # 使用TkAgg后端，支持交互式显示
 import matplotlib.pyplot as plt
@@ -60,10 +62,14 @@ class VehiclePlotter(Node):
         
         # Frenet坐标数据存储（只保存当前点，不保存历史）
         self.current_frenet_s = None
-        self.current_frenet_d = None
+        self.current_frenet_l = None
 
         # SL边界数据存储（保存当前所有障碍物的边界）
-        self.current_sl_boundaries = []  # 列表，每个元素为 {'vehicle_id': str, 'boundary_s': list, 'boundary_l': list}
+        self.current_sl_boundaries = []
+        # PathBoundary：考虑障碍物收缩后的上下边界 (s, l_upper, l_lower)
+        self.current_path_boundary = None
+        # QP Frenet 路径 (s, l)，用于 s-l 图可视化
+        self.current_qp_frenet_path = None
 
         # 数据锁（用于线程安全）
         self.data_lock = threading.Lock()
@@ -88,6 +94,8 @@ class VehiclePlotter(Node):
         self.line_speed_error = None
         self.line_accel_error = None
         self.obstacle_patches = []  # 障碍物边界多边形patch列表
+        self.line_path_upper = None  # PathBoundary 上边界线
+        self.line_path_lower = None  # PathBoundary 下边界线
 
         # 订阅绘图数据话题
         self.plot_data_sub = self.create_subscription(
@@ -120,6 +128,25 @@ class VehiclePlotter(Node):
         else:
             self.sl_boundary_array_sub = None
             self.get_logger().warn("SLBoundaryArray 消息类型未找到，SL边界数组订阅功能将不可用")
+
+        # 订阅 PathBoundary
+        if PathBoundary is not None:
+            self.path_boundary_sub = self.create_subscription(
+                PathBoundary,
+                '/path_smoothing/path_boundary',
+                self.path_boundary_callback,
+                10
+            )
+        else:
+            self.path_boundary_sub = None
+
+        # 订阅 QP Frenet 路径 (nav_msgs/Path: x=s, y=l)
+        self.qp_frenet_path_sub = self.create_subscription(
+            Path,
+            '/path_smoothing/qp_frenet_path',
+            self.qp_frenet_path_callback,
+            10
+        )
 
         # 初始化绘图
         if self.enable_plotting:
@@ -169,18 +196,20 @@ class VehiclePlotter(Node):
         """Frenet坐标回调函数"""
         if not self.enable_plotting:
             return
-        
+
         try:
-            if len(msg.s) == 0 or len(msg.d) == 0:
+            # 优先使用 msg.l（新命名），回退到 msg.d（旧命名兼容）
+            l_list = getattr(msg, 'l', getattr(msg, 'd', None))
+            if l_list is None or len(msg.s) == 0 or len(l_list) == 0:
                 return
-            
+
             # 线程安全地更新当前点（不保存历史）
             with self.data_lock:
-                # 只保存当前车辆位置的 (s, d)
-                if len(msg.s) > 0 and len(msg.d) > 0:
+                # 只保存当前车辆位置的 (s, l)
+                if len(msg.s) > 0 and len(l_list) > 0:
                     self.current_frenet_s = msg.s[0]
-                    self.current_frenet_d = msg.d[0]
-        
+                    self.current_frenet_l = l_list[0]
+
         except Exception as e:
             self.get_logger().warn(f"处理Frenet坐标数据失败: {e}")
 
@@ -214,6 +243,42 @@ class VehiclePlotter(Node):
         except Exception as e:
             self.get_logger().warn(f"处理SL边界数组数据失败: {e}")
 
+    def path_boundary_callback(self, msg):
+        """PathBoundary 回调：保存当前上下边界用于绘图"""
+        if not self.enable_plotting:
+            return
+        try:
+            with self.data_lock:
+                if len(msg.s) == 0 or len(msg.s) != len(msg.l_upper) or len(msg.s) != len(msg.l_lower):
+                    self.current_path_boundary = None
+                    return
+                self.current_path_boundary = {
+                    's': list(msg.s),
+                    'l_upper': list(msg.l_upper),
+                    'l_lower': list(msg.l_lower),
+                    'valid': msg.valid,
+                }
+        except Exception as e:
+            self.get_logger().warn(f"处理 PathBoundary 失败: {e}")
+
+    def qp_frenet_path_callback(self, msg):
+        """QP Frenet 路径回调：nav_msgs/Path 中 x=s, y=l"""
+        if not self.enable_plotting:
+            return
+        try:
+            with self.data_lock:
+                if len(msg.poses) == 0:
+                    self.current_qp_frenet_path = None
+                    return
+                s_list = []
+                l_list = []
+                for ps in msg.poses:
+                    s_list.append(ps.pose.position.x)
+                    l_list.append(ps.pose.position.y)
+                self.current_qp_frenet_path = {'s': s_list, 'l': l_list}
+        except Exception as e:
+            self.get_logger().warn(f"处理 QP Frenet Path 失败: {e}")
+
     def _init_plot(self):
         """初始化误差实时绘图"""
         try:
@@ -228,6 +293,9 @@ class VehiclePlotter(Node):
             self.scatter_sd = self.ax1.scatter([], [], s=200, c='red', marker='o', 
                                                edgecolors='darkred', linewidths=2, 
                                                label='Current Vehicle Position (s-d)', zorder=5)
+            self.line_path_upper, = self.ax1.plot([], [], 'b-', label='PathBoundary upper', linewidth=1.5, zorder=4)
+            self.line_path_lower, = self.ax1.plot([], [], 'r-', label='PathBoundary lower', linewidth=1.5, zorder=4)
+            self.line_qp_frenet, = self.ax1.plot([], [], 'g-', label='QP Frenet Path', linewidth=1.5, zorder=4)
             self.line_he, = self.ax2.plot([], [], 'g-', label='Heading Error', linewidth=1.5)
             self.line_cross_track_error, = self.ax2.plot([], [], 'r-', label='Cross Track Error', linewidth=1.5)
             self.line_normalized_steer, = self.ax3.plot([], [], 'r-', label='Normalized Steer', linewidth=1.5)
@@ -243,8 +311,9 @@ class VehiclePlotter(Node):
             self.ax1.set_title('Frenet Coordinates (s-d)', fontsize=12)
             self.ax1.grid(True, alpha=0.3)
             self.ax1.legend(loc='upper right')
-            self.ax1.set_xlim([0.0, 180.0])  # 固定横轴范围：180m
-            self.ax1.set_ylim([-5.0, 5.0])  # 固定纵轴范围：10m（-3到+3）
+            # 局部 Frenet 坐标：自车为 s=0，后方 BACKWARD_DISTANCE=30m，前方 REFERENCE_LINE_HORIZON=50m
+            self.ax1.set_xlim([-30.0, 50.0])
+            self.ax1.set_ylim([-8.0, 8.0])  # 固定纵轴范围：16m
 
             # 设置子图2：航向误差和横向误差
             self.ax2.set_xlabel('Time (s)', fontsize=10)
@@ -336,18 +405,30 @@ class VehiclePlotter(Node):
                 speed_error_data = list(self.speed_error_history)
                 accel_error_data = list(self.accel_error_history)
                 current_s = self.current_frenet_s
-                current_d = self.current_frenet_d
+                current_l = self.current_frenet_l
                 current_sl_boundaries = self.current_sl_boundaries.copy()
+                current_path_boundary = self.current_path_boundary.copy() if self.current_path_boundary else None
+                current_qp_frenet = self.current_qp_frenet_path.copy() if self.current_qp_frenet_path else None
 
             if len(time_data) == 0:
                 return
 
-            # 更新s-d当前点（只显示当前坐标点，不显示历史轨迹）
-            if current_s is not None and current_d is not None:
-                # 更新散点图位置
-                self.scatter_sd.set_offsets([[current_s, current_d]])
-                
-                # s-d图的坐标轴范围已固定，无需调整
+            # 更新s-l当前点（只显示当前坐标点，不显示历史轨迹）
+            if current_s is not None and current_l is not None:
+                self.scatter_sd.set_offsets([[current_s, current_l]])
+            # 更新 PathBoundary
+            if current_path_boundary is not None and current_path_boundary.get('s'):
+                self.line_path_upper.set_data(current_path_boundary['s'], current_path_boundary['l_upper'])
+                self.line_path_lower.set_data(current_path_boundary['s'], current_path_boundary['l_lower'])
+            else:
+                self.line_path_upper.set_data([], [])
+                self.line_path_lower.set_data([], [])
+
+            # 更新 QP Frenet 路径（不保留历史，每帧替换）
+            if current_qp_frenet is not None and current_qp_frenet.get('s') and current_qp_frenet.get('l'):
+                self.line_qp_frenet.set_data(current_qp_frenet['s'], current_qp_frenet['l'])
+            else:
+                self.line_qp_frenet.set_data([], [])
 
             # 清除之前的障碍物边界并重新绘制
             # 注意：matplotlib的patch对象需要手动管理

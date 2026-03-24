@@ -17,6 +17,11 @@ import time
 import threading
 import carla
 
+try:
+    from map_load.msg import PathBoundary
+except ImportError:
+    PathBoundary = None
+
 from .stanley_controller import StanleyController
 from .pid_controller import PIDController
 from .bicycle_model_ekf import BicycleModelEKF
@@ -95,7 +100,11 @@ class CarlaVehicleControl(Node):
         
         self.waypoints = []
         self.current_waypoint_index = 0
-        
+        self.qp_path = []
+        # self.qp_path_curvatures = []
+        self.ref_nearest_idx = 0
+        self.traj_nearest_idx = 0
+
         self.start_pose = None
         self.goal_pose = None
         self.wait_for_goal = True
@@ -238,11 +247,29 @@ class CarlaVehicleControl(Node):
             self.path_update_points_callback,
             10
         )
+
+        self.qp_xy_path_sub = self.create_subscription(
+            Path,
+            '/path_smoothing/qp_xy_path',
+            self.qp_path_callback,
+            10
+        )
         
         # 状态变量：用于同步索引和点列表
         self.pending_update_index = None
         self.pending_update_points = None
-        
+        # PathBoundary 有效标志：若为 False（决策不一致等）则停车
+        self.path_boundary_valid = True
+        if PathBoundary is not None:
+            self.path_boundary_sub = self.create_subscription(
+                PathBoundary,
+                '/path_smoothing/path_boundary',
+                self.path_boundary_callback,
+                10
+            )
+        else:
+            self.path_boundary_sub = None
+
         # 参考线发布相关
         self.reference_path_pub = self.create_publisher(
             Path,
@@ -580,7 +607,48 @@ class CarlaVehicleControl(Node):
         
         self.pending_update_points = update_points
         self._try_apply_path_update()
-    
+
+    def path_boundary_callback(self, msg):
+        """PathBoundary 回调：决策无效时置标志，控制循环内会停车"""
+        self.path_boundary_valid = msg.valid
+
+    def qp_path_callback(self, msg):
+        """QP XY 路径回调：PathData，供 Stanley 跟踪"""
+        points = []
+        for pose in msg.poses:
+            points.append((pose.pose.position.x, pose.pose.position.y))
+        with self.data_lock:
+            self.qp_path = points
+            # self.qp_path_curvatures = self.compute_curvatures(points) if len(points) >= 3 else []
+            self.traj_nearest_idx = 0
+
+    def _find_nearest_idx_on_path(self, path, x, y, hint_idx=0):
+        """在路径上查找距 (x,y) 最近的段起点索引"""
+        if len(path) < 2:
+            return 0
+        current_pos = np.array([x, y])
+        min_dist = float('inf')
+        nearest_idx = 0
+        min_search = max(0, hint_idx - 50)
+        max_search = min(len(path) - 1, hint_idx + 50)
+        for i in range(min_search, max_search):
+            if i + 1 >= len(path):
+                break
+            start = np.array(path[i])
+            end = np.array(path[i + 1])
+            seg = end - start
+            seg_len = np.linalg.norm(seg)
+            if seg_len < 1e-6:
+                continue
+            unit = seg / seg_len
+            proj = np.clip(np.dot(current_pos - start, unit), 0, seg_len)
+            nearest = start + proj * unit
+            d = np.linalg.norm(current_pos - nearest)
+            if d < min_dist:
+                min_dist = d
+                nearest_idx = i
+        return nearest_idx
+
     def _try_apply_path_update(self):
         """尝试应用路径增量更新（需要同时收到索引和点列表）"""
         if self.pending_update_index is None or self.pending_update_points is None:
@@ -625,6 +693,10 @@ class CarlaVehicleControl(Node):
         with self.data_lock:
             self.waypoints = []
             self.current_waypoint_index = 0
+            self.qp_path = []
+            # self.qp_path_curvatures = []
+            self.ref_nearest_idx = 0
+            self.traj_nearest_idx = 0
             self.path_curvatures = []
         
         # 重置控制相关状态
@@ -798,12 +870,23 @@ class CarlaVehicleControl(Node):
     def control_loop(self):
         """控制循环"""
         try:
+            if not self.path_boundary_valid:
+                self.publish_stop()
+                return
             with self.data_lock:
                 if not self.waypoints:
                     return
-                
                 waypoints = self.waypoints.copy()
-                current_waypoint_index = self.current_waypoint_index
+                qp_path = self.qp_path.copy() if self.qp_path else []
+                path_to_track = qp_path if qp_path else waypoints
+                # path_curvatures = self.qp_path_curvatures if qp_path else self.path_curvatures
+                start_idx = self.traj_nearest_idx if qp_path else self.ref_nearest_idx
+
+                self.get_logger().info("------------------------")
+                self.get_logger().info(f"第一个qp_path点: x={qp_path[0][0]}, y={qp_path[0][1]}")
+                self.get_logger().info(f"第二个qp_path点: x={qp_path[1][0]}, y={qp_path[1][1]}")
+                self.get_logger().info(f"第三个qp_path点: x={qp_path[2][0]}, y={qp_path[2][1]}")
+                self.get_logger().info(f"ego当前位置: x={self.current_x}, y={self.current_y}")
 
                 if not self.is_spd_updated:
                     self.current_speed += self.control_dt * self.measured_accel
@@ -847,21 +930,31 @@ class CarlaVehicleControl(Node):
                     return
             
             # 使用Stanley控制器计算转向角
-            steering_angle, target_point, cross_track_error, curvature, nearest_idx = self.stanley.compute_steering(
-                current_x, current_y, current_yaw, current_v, waypoints, self.control_dt, self.vehicle_wheelbase, self.path_curvatures, current_waypoint_index
+            steering_angle, target_point, heading_error, cross_track_error, curvature, nearest_idx = self.stanley.compute_steering(
+                current_x, current_y, current_yaw, current_v, path_to_track, self.control_dt, self.vehicle_wheelbase, start_idx, forward_only=bool(qp_path)
             )
 
-            self.current_waypoint_index = nearest_idx
-            
-            # 发布最近路径点索引供路径平滑与感知节点使用
+            self.get_logger().info(f"heading_error: {heading_error}, cross_track_error: {cross_track_error}, nearest_idx: {nearest_idx}")
+
+            if qp_path:
+                new_ref_idx = self._find_nearest_idx_on_path(waypoints, current_x, current_y, self.ref_nearest_idx)
+                with self.data_lock:
+                    self.traj_nearest_idx = nearest_idx
+                    self.ref_nearest_idx = new_ref_idx
+            else:
+                with self.data_lock:
+                    self.ref_nearest_idx = nearest_idx
+                    self.current_waypoint_index = nearest_idx
+
+            # 发布参考线最近索引供 path_smoother / vehicle_perception 使用
             nearest_idx_msg = Int32()
-            nearest_idx_msg.data = nearest_idx
+            nearest_idx_msg.data = self.ref_nearest_idx
             self.nearest_idx_pub.publish(nearest_idx_msg)
 
             # 发布参考线（每隔两个控制周期发布一次）
             self.reference_path_counter += 1
             if self.reference_path_counter >= 2:
-                self.publish_reference_path(waypoints, nearest_idx, current_v)
+                self.publish_reference_path(waypoints, self.ref_nearest_idx, current_v)
                 self.reference_path_counter = 0
 
             # 速度规划
@@ -948,8 +1041,10 @@ class CarlaVehicleControl(Node):
         
         # 重置控制状态
         self.current_waypoint_index = 0
+        self.ref_nearest_idx = 0
+        self.traj_nearest_idx = 0
         self.log_counter = 0
-        # self.speed_controller.reset()  # 若有速度控制器，保留
+        # self.path_curvatures = self.compute_curvatures(self.waypoints) if len(self.waypoints) >= 3 else []
         self.start_time = time.time()
         
         self.control_timer = self.create_timer(self.control_dt, self.control_loop)
