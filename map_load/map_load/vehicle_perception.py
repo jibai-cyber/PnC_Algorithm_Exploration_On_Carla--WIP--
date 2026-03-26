@@ -33,8 +33,19 @@ RESET = "\033[0m"
 REFERENCE_LINE_HORIZON = 50.0  # 自车前方参考线/采样 s 范围 (m)
 BACKWARD_DISTANCE = 30.0       # 自车后方参考线/采样 s 范围 (m)
 ROAD_WIDTH_TOTAL = 8.0         # 双车道总宽 (m)
-ROAD_LEFT_BOUNDARY_L = 6.0     # 道路左边界 l (右车道中心为 0)
+
+# 左边界：不借对向时仅本向车道；借对向时与历史 ROAD_LEFT_BOUNDARY_L=6 一致
+ROAD_LEFT_BOUNDARY_L_EGO = 2.0   # 不借对向时道路左边界 l（本向车道侧）
+ROAD_LEFT_BOUNDARY_L_FULL = 6.0  # 允许借对向时的左边界 l（拓展凸空间）
+ROAD_LEFT_BOUNDARY_L = ROAD_LEFT_BOUNDARY_L_FULL
 ROAD_RIGHT_BOUNDARY_L = -2.0   # 道路右边界 l
+
+BORROW_TRIGGER_TIME_S = 2.0    # 预留反应/规划时间 (s)
+BORROW_TRIGGER_EXTRA_M = 10.0  # 触发距离加项 (m)，与 BORROW_S_PAD_FRONT 区分
+# 借道走廊沿 s 的扩张（相对各障碍 start_s / end_s；多障碍取并集）
+BORROW_S_PAD_FRONT = 10.0
+BORROW_S_PAD_REAR = 5.0
+
 PATH_BOUNDARY_S_RESOLUTION = 0.5  # s 方向采样间隔 (m)
 K_ZERO_VAL = 1e-6              # 浮点比较/重叠判断容差
 
@@ -153,15 +164,37 @@ def _intervals_overlap(a_lo: float, a_hi: float, b_lo: float, b_hi: float) -> bo
     return max(a_lo, b_lo) <= min(a_hi, b_hi) + K_ZERO_VAL
 
 
-def _path_bounds_from_two_elements(elements, a_key, b_key, ego_s, obs_info_list):
+def _merge_s_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """将 [lo,hi] 区间合并为有序、互不重叠的并集。"""
+    if not intervals:
+        return []
+    pairs = sorted([(float(lo), float(hi)) for lo, hi in intervals], key=lambda x: x[0])
+    out: list[list[float]] = [[pairs[0][0], pairs[0][1]]]
+    for lo, hi in pairs[1:]:
+        if lo <= out[-1][1] + K_ZERO_VAL:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return [(float(a), float(b)) for a, b in out]
+
+
+def _path_bounds_from_two_elements(
+    elements, a_key, b_key, ego_s, obs_info_list,
+    road_left_l: float | None = None,
+    road_right_l: float | None = None,
+):
     """
     由当前 s 下选定的两个元素 a_key（提供上界）, b_key（提供下界）得到 path_lower, path_upper。
     返回值：(path_lower, path_upper)；若无法解析则返回 (None, None)。
     """
+    if road_left_l is None:
+        road_left_l = ROAD_LEFT_BOUNDARY_L_FULL
+    if road_right_l is None:
+        road_right_l = ROAD_RIGHT_BOUNDARY_L
     obs_by_id = {o["id"]: o for o in obs_info_list}
     def get_upper(key):
         if key == "road_left":
-            return ROAD_LEFT_BOUNDARY_L
+            return road_left_l
         o = obs_by_id.get(key)
         if o is None:
             return None
@@ -218,6 +251,12 @@ class VehiclePerception(Node):
         self.raw_path_s = []
         self.raw_path_l_upper = []
         self.raw_path_l_lower = []
+
+        # 借道决策（节点内读写 self.borrow_*；后期可由配置或上层回调统一赋值）
+        self.borrow_opposing_lane = True
+        self.borrow_revoke_emergency = False
+        self.borrow_opposing_lane_prev = True
+        self.borrow_gate_warned_latched = False
 
         # 上周期 QP 解的缓存，用于判断复用条件和提供平滑初始状态
         self.prev_qp_solution = {
@@ -388,9 +427,53 @@ class VehiclePerception(Node):
             self.current_waypoints = []
             self.waypoints_received = False
             self.last_nearest_idx = 0
+        self._reset_borrow_state()
         self.get_logger().info(
             f"{CYAN}✓ 感知：已清空路径与 QP 缓存{RESET}"
         )
+
+    def _reset_borrow_state(self) -> None:
+        """初始位姿重置等场景恢复借道状态默认。"""
+        self.borrow_opposing_lane = True
+        self.borrow_revoke_emergency = False
+        self.borrow_opposing_lane_prev = True
+        self.borrow_gate_warned_latched = False
+
+    def _sync_borrow_at_path_boundary_start(
+        self, obs_info_list: list, has_considered_obs: bool
+    ) -> None:
+        """
+        无 consider 障碍时：借道意愿恒为 false，并清除紧急标志与边沿状态，避免误报「正常结束」。
+        有障碍时：不覆盖外部写入的 self.borrow_opposing_lane / self.borrow_revoke_emergency。
+        """
+        if not has_considered_obs:
+            self.borrow_opposing_lane = False
+            self.borrow_revoke_emergency = False
+            self.borrow_opposing_lane_prev = False
+
+    def _finalize_borrow_after_path_boundary(self, borrow_false_emergency: bool) -> None:
+        """紧急撤销消费后清除 borrow_revoke_emergency；刷新 prev 供下周期边沿检测。"""
+        if borrow_false_emergency:
+            self.borrow_revoke_emergency = False
+        self.borrow_opposing_lane_prev = self.borrow_opposing_lane
+
+    @staticmethod
+    def _effective_road_left_l(
+        ego_s: float,
+        union_merged: list[tuple[float, float]],
+        borrow_allowed: bool,
+        has_considered_obs: bool,
+    ) -> float:
+        """
+        当前 s 站道路左边界 l：无 consider 障碍或不允许借道时用 EGO；
+        允许借道且 ego_s 落在并集扩张区间内时用 FULL。
+        """
+        if not has_considered_obs or not borrow_allowed:
+            return ROAD_LEFT_BOUNDARY_L_EGO
+        for lo, hi in union_merged:
+            if lo - K_ZERO_VAL <= ego_s <= hi + K_ZERO_VAL:
+                return ROAD_LEFT_BOUNDARY_L_FULL
+        return ROAD_LEFT_BOUNDARY_L_EGO
 
     def ego_info_callback(self, msg):
         """
@@ -1105,6 +1188,38 @@ class VehiclePerception(Node):
         # 检查是否可以复用上周期的 QP 解
         qp_reusable = self._check_path_reusable(obs_info_list, current_ego_s, current_ego_l)
 
+        has_considered_obs = any(o.get("consider", False) for o in obs_info_list)
+        self._sync_borrow_at_path_boundary_start(obs_info_list, has_considered_obs)
+
+        v = max(float(self.current_speed), 0.0)
+        trigger_dist = v * BORROW_TRIGGER_TIME_S + BORROW_TRIGGER_EXTRA_M
+
+        borrow_union: list[tuple[float, float]] = []
+        for o in obs_info_list:
+            if not o.get("consider", False):
+                continue
+            lo = float(o["start_s"]) - BORROW_S_PAD_FRONT
+            hi = float(o["end_s"]) + BORROW_S_PAD_REAR
+            borrow_union.append((lo, hi))
+        union_merged = _merge_s_intervals(borrow_union)
+
+        # TODO: 在时空联合规划/对向安全确认后，最小化 FULL 左边界与并集区间占用（仅必要 s 段借道）
+        needs_trigger = any(
+            o.get("consider", False) and float(o["start_s"]) <= trigger_dist + K_ZERO_VAL
+            for o in obs_info_list
+        )
+
+        borrow_now = self.borrow_opposing_lane
+        emergency_revoke_flag = self.borrow_revoke_emergency
+
+        borrow_false_emergency = (
+            self.borrow_opposing_lane_prev and not borrow_now and emergency_revoke_flag
+        )
+        # borrow_false_normal = (
+        #     self.borrow_opposing_lane_prev and not borrow_now and not emergency_revoke_flag
+        # )
+        borrow_gate_blocked = needs_trigger and not borrow_now and has_considered_obs
+
         # s 从 ego 位置(0) 到局部参考线终点的弧长，起点/终点时做裁剪
         s_min_eff = 0.0
         s_max_eff = min(
@@ -1113,6 +1228,7 @@ class VehiclePerception(Node):
         )
         s_samples = np.arange(s_min_eff, s_max_eff + K_ZERO_VAL, PATH_BOUNDARY_S_RESOLUTION)
         if len(s_samples) == 0:
+            self._finalize_borrow_after_path_boundary(borrow_false_emergency)
             return
         # 最终（已施加 ADC bound + lat_buffer）的 PathBoundary
         s_list = []
@@ -1129,8 +1245,10 @@ class VehiclePerception(Node):
                 o for o in obs_info_list
                 if o["consider"] and o["start_s"] <= ego_s <= o["end_s"]
             ]
-            # 道路左右边界
-            road_left = (ROAD_LEFT_BOUNDARY_L, ROAD_LEFT_BOUNDARY_L, "road_left", None)
+            rl = self._effective_road_left_l(
+                ego_s, union_merged, borrow_now, has_considered_obs,
+            )
+            road_left = (rl, rl, "road_left", None)
             road_right = (ROAD_RIGHT_BOUNDARY_L, ROAD_RIGHT_BOUNDARY_L, "road_right", None)
             # 先只对障碍物内部排序（当前 s 下无 l 投影的 obs 不参与）
             obs_elements = []
@@ -1173,7 +1291,8 @@ class VehiclePerception(Node):
             if prev_two is not None:
                 a_key, b_key = prev_two
                 path_lo_old, path_hi_old = _path_bounds_from_two_elements(
-                    elements, a_key, b_key, ego_s, obs_info_list
+                    elements, a_key, b_key, ego_s, obs_info_list,
+                    road_left_l=rl, road_right_l=ROAD_RIGHT_BOUNDARY_L,
                 )
                 if path_lo_old is None:
                     need_recompute = True
@@ -1204,7 +1323,7 @@ class VehiclePerception(Node):
                         if not need_recompute:
                             # 先按道路几何边界裁剪
                             path_lo_old = max(path_lo_old, ROAD_RIGHT_BOUNDARY_L)
-                            path_hi_old = min(path_hi_old, ROAD_LEFT_BOUNDARY_L)
+                            path_hi_old = min(path_hi_old, rl)
                             # 保存收缩前（仅考虑道路与障碍物收缩）的 PathBoundary
                             raw_s_list.append(ego_s)
                             raw_l_lower_list.append(path_lo_old)
@@ -1254,13 +1373,13 @@ class VehiclePerception(Node):
                         fallback_lower = elem_left[1]
                         prev_two = (elem_right[2], elem_left[2])
                     else:
-                        path_upper = ROAD_LEFT_BOUNDARY_L
+                        path_upper = rl
                         path_lower = ROAD_RIGHT_BOUNDARY_L
                         prev_two = ("road_left", "road_right")
                 else:
                     if n_left > 0:
                         first_obs = obs_order[0]
-                        path_upper = ROAD_LEFT_BOUNDARY_L
+                        path_upper = rl
                         path_lower = first_obs[3]
                         prev_two = ("road_left", first_obs[1]["id"])
                     elif n_right > 0:
@@ -1269,12 +1388,13 @@ class VehiclePerception(Node):
                         path_lower = ROAD_RIGHT_BOUNDARY_L
                         prev_two = (last_obs[1]["id"], "road_right")
                     else:
-                        path_upper = ROAD_LEFT_BOUNDARY_L
+                        path_upper = rl
                         path_lower = ROAD_RIGHT_BOUNDARY_L
                         prev_two = ("road_left", "road_right")
 
                 path_lower, path_upper = _path_bounds_from_two_elements(
-                    elements, prev_two[0], prev_two[1], ego_s, obs_info_list
+                    elements, prev_two[0], prev_two[1], ego_s, obs_info_list,
+                    road_left_l=rl, road_right_l=ROAD_RIGHT_BOUNDARY_L,
                 )
 
                 if path_upper is None or path_lower is None:
@@ -1283,12 +1403,12 @@ class VehiclePerception(Node):
                         path_lower = fallback_lower
                         path_upper = fallback_upper
                     else:
-                        path_upper = ROAD_LEFT_BOUNDARY_L
+                        path_upper = rl
                         path_lower = ROAD_RIGHT_BOUNDARY_L
 
                 # 先按道路边界裁剪
                 path_lower = max(path_lower, ROAD_RIGHT_BOUNDARY_L)
-                path_upper = min(path_upper, ROAD_LEFT_BOUNDARY_L)
+                path_upper = min(path_upper, rl)
                 # 保存收缩前（仅考虑道路与障碍物收缩）的 PathBoundary
                 raw_s_list.append(ego_s)
                 raw_l_lower_list.append(path_lower)
@@ -1315,6 +1435,25 @@ class VehiclePerception(Node):
                 s_list.append(ego_s)
                 l_upper_list.append(adc_hi)
                 l_lower_list.append(adc_lo)
+
+        if borrow_false_emergency:
+            valid = False
+            self.get_logger().error(
+                "借道撤销（紧急）：PathBoundary 无效；确认安全后设 borrow_revoke_emergency=False，再设 borrow_opposing_lane"
+            )
+        elif borrow_gate_blocked:
+            valid = False
+            if not self.borrow_gate_warned_latched:
+                self.get_logger().warn(
+                    f"借道未允许且障碍已进入触发窗口 (≤{trigger_dist:.1f}m)，PathBoundary 无效，原地等待 borrow_opposing_lane=True"
+                )
+                self.borrow_gate_warned_latched = True
+        else:
+            self.borrow_gate_warned_latched = False
+        #     if borrow_false_normal:
+        #         self.get_logger().info("借道结束（正常）：左边界收紧至本向车道")
+
+        self._finalize_borrow_after_path_boundary(borrow_false_emergency)
 
         # 缓存未施加 ADC bound / lat_buffer 前的 PathBoundary，便于后续 ADCVertexConstraints 使用
         self.raw_path_s = raw_s_list
@@ -1438,7 +1577,6 @@ class VehiclePerception(Node):
                     l_init=l_init,
                     dl_init=dl_init,
                     ddl_init=ddl_init,
-                    l_ref=np.zeros_like(s_qp),
                     debug_callback=_qp_debug,
                 )
                 if sol is None:

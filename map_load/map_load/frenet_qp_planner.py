@@ -55,8 +55,7 @@ class FrenetQPPlanner:
     def build_frenet_qp_3n(
         n: int,
         delta_s: float,
-        w_ref: float = 0.1,
-        w_l: float = 0.1,
+        w_ref: float = 0.3,
         w_dl: float = 0.1,
         w_ddl: float = 0.1,
         w_dddl: float = 0.01,
@@ -76,7 +75,7 @@ class FrenetQPPlanner:
         if l_ref is None:
             l_ref = np.zeros(n)
         else:
-            l_ref = np.asarray(l_ref).reshape(-1)
+            l_ref = np.asarray(l_ref, dtype=float).reshape(-1)
             assert l_ref.shape[0] == n
 
         # 位置提取矩阵 E_pos (n × 3n)
@@ -122,9 +121,9 @@ class FrenetQPPlanner:
         # --- P ---
         P = sp.lil_matrix((total_vars, total_vars))
 
-        # 参考线跟踪 + 位置项
-        if w_ref + w_l > 0.0:
-            P += 2.0 * (w_ref + w_l) * (E_pos.T @ E_pos)
+        # 横向位置
+        if w_ref > 0.0:
+            P += 2.0 * w_ref * (E_pos.T @ E_pos)
 
         # 速度项
         if w_dl > 0.0:
@@ -448,6 +447,11 @@ class FrenetQPPlanner:
         """
         构建并求解 QP，返回每个采样点上的 (l, dl, ddl)。
         若无可行解或 osqp 不可用，则返回 None。
+
+        l_ref: w_ref 跟踪项的目标；每行对应 path_boundary 同一采样站。
+               None 时使用 path_boundary 的横向可行域中心 (l_lower + l_upper) / 2（与 vehicle_perception
+               中 ADC 后的走廊一致），使代价偏向凸空间几何中心而非 Frenet 参考线 l=0。
+               若需仍贴合几何参考线，传入全零向量 np.zeros(n)。
         """
         if osqp is None:
             return None
@@ -457,7 +461,6 @@ class FrenetQPPlanner:
         if weights is None:
             weights = {}
         w_ref = float(weights.get("w_ref", 1.0))
-        w_l = float(weights.get("w_l", 0.1))
         w_dl = float(weights.get("w_dl", 0.1))
         w_ddl = float(weights.get("w_ddl", 0.1))
         w_dddl = float(weights.get("w_dddl", 0.01))
@@ -465,16 +468,26 @@ class FrenetQPPlanner:
         w_end_dl = float(weights.get("w_end_dl", 0.1))
         w_end_ddl = float(weights.get("w_end_ddl", 0.01))
 
+        # w_ref*(l - l_ref)^2：默认跟踪 PathBoundary（ADC）各站中心，避免障碍侵入时仍强拉向 l=0
+        if l_ref is None:
+            assert path_boundary.shape == (self.n, 2)
+            l_ref_resolved = (
+                path_boundary[:, 0].astype(np.float64)
+                + path_boundary[:, 1].astype(np.float64)
+            ) * 0.5
+        else:
+            l_ref_resolved = np.asarray(l_ref, dtype=np.float64).reshape(-1)
+            assert l_ref_resolved.shape[0] == self.n
+
         # P, q
         P, q = self.build_frenet_qp_3n(
             self.n,
             self.delta_s,
             w_ref=w_ref,
-            w_l=w_l,
             w_dl=w_dl,
             w_ddl=w_ddl,
             w_dddl=w_dddl,
-            l_ref=l_ref,
+            l_ref=l_ref_resolved,
             l_end=l_end,
             l_end_dl=l_end_dl,
             l_end_ddl=l_end_ddl,

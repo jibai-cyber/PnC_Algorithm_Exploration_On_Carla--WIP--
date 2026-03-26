@@ -40,9 +40,9 @@ class FrenetPathPlanner:
         self.l_list = []
         self.u_list = []
 
-    def build_frenet_qp_3n(n, delta_s, 
-                       w_ref=1.0, w_l=0.1, w_dl=0.1, w_ddl=0.1, w_dddl=0.01,
-                       l_ref=None, 
+    def build_frenet_qp_3n(n, delta_s,
+                       w_ref=1.0, w_dl=0.1, w_ddl=0.1, w_dddl=0.01,
+                       l_ref=None,
                        l_end=0.0, l_end_dl=0.0, l_end_ddl=0.0,
                        w_end_l=1.0, w_end_dl=0.1, w_end_ddl=0.01):
         """
@@ -52,8 +52,7 @@ class FrenetPathPlanner:
         参数：
         n: 路径点数量
         delta_s: 相邻点间的弧长间隔
-        w_ref: 参考线跟踪权重
-        w_l: 横向位置权重
+        w_ref: 参考线跟踪权重 (l - l_ref)^2
         w_dl: 横向速度权重
         w_ddl: 横向加速度权重
         w_dddl: 横向加加速度权重
@@ -117,8 +116,8 @@ class FrenetPathPlanner:
         # 初始化P为零矩阵
         P = sp.lil_matrix((total_vars, total_vars))
         
-        # 参考线跟踪项 + 位置项
-        P += 2 * (w_ref + w_l) * (E_pos.T @ E_pos)
+        # 参考线跟踪项 w_ref*(l - l_ref)^2
+        P += 2 * w_ref * (E_pos.T @ E_pos)
         
         # 速度项
         if w_dl > 0:
