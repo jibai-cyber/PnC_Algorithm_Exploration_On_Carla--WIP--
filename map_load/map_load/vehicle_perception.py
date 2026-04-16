@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """CARLA车辆感知模块 - 处理障碍物检测和坐标转换"""
 
+from typing import Any, Optional
+
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import PoseStamped, Pose
 from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import Int32
@@ -17,11 +20,31 @@ except ImportError:
     SLBoundary = None
     SLBoundaryArray = None
     PathBoundary = None
+try:
+    from map_load.msg import (
+        LocalPlanningPath,
+        PlanningPathPoint,
+        PlanningSpeedProfile,
+        PlanningSpeedPoint,
+        EgoPlanningTrajectory,
+        PlanningTrajectoryPoint,
+        PlanningObstacle, 
+        PlanningObstacleArray
+    )
+except ImportError:
+    LocalPlanningPath = None
+    PlanningPathPoint = None
+    PlanningSpeedProfile = None
+    PlanningSpeedPoint = None
+    EgoPlanningTrajectory = None
+    PlanningTrajectoryPoint = None
+    PlanningObstacle = None
+    PlanningObstacleArray = None
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from tf_transformations import euler_from_quaternion
+import copy
 import math
 import numpy as np
-import time
 import threading
 from .frenet_qp_planner import FrenetQPPlanner
 
@@ -40,14 +63,18 @@ ROAD_LEFT_BOUNDARY_L_FULL = 6.0  # 允许借对向时的左边界 l（拓展凸�
 ROAD_LEFT_BOUNDARY_L = ROAD_LEFT_BOUNDARY_L_FULL
 ROAD_RIGHT_BOUNDARY_L = -2.0   # 道路右边界 l
 
-BORROW_TRIGGER_TIME_S = 2.0    # 预留反应/规划时间 (s)
-BORROW_TRIGGER_EXTRA_M = 10.0  # 触发距离加项 (m)，与 BORROW_S_PAD_FRONT 区分
 # 借道走廊沿 s 的扩张（相对各障碍 start_s / end_s；多障碍取并集）
 BORROW_S_PAD_FRONT = 10.0
 BORROW_S_PAD_REAR = 5.0
 
+# obs is_static 判定速度阈值
+OBS_STATIC_SPEED_THRESH_MPS = 0.1
+
 PATH_BOUNDARY_S_RESOLUTION = 0.5  # s 方向采样间隔 (m)
 K_ZERO_VAL = 1e-6              # 浮点比较/重叠判断容差
+
+# 在stop_line前判断借道的距离
+JUDGE_DISTANCE_BEFORE_STOP_LINE = 1.0 # m
 
 # ADC 边界与横向 buffer（用于在 PathBoundary 上收缩 ego 车辆中心可行域）
 EGO_LAT_BUFFER = 0.3  # m
@@ -55,14 +82,11 @@ EGO_WIDTH_DEFAULT = 1.8  # m，若未能从车辆状态话题获取则使用该�
 # 当在 s 方向上距离自车小于该值且无可行走廊时，才判定为 blocked 并触发停车
 BLOCK_STOP_DISTANCE = 10.0  # m
 
-# 可自定义的静态障碍物 ID 名称（按出现顺序依次分配）
-# TODO: remove this after testing
-CUSTOM_OBSTACLE_IDS = [
-    "static_vehicle_1",
-    "static_vehicle_2",
-    "static_vehicle_3",
-]
-
+# ---------- PlanningSpeedProfile 校验与重采样 ----------
+PLANNING_SPEED_PROFILE_RESAMPLE_DT_S = 0.1  # 重采样时间步长 (s)
+PLANNING_SPEED_PROFILE_T_HORIZON_S = 5.0    # 要求输入末点 t≥此值；重采样 t∈[0, 此值] (s)
+# PlanningObstacleArray.t_horizon，与 speed_planner ST 时间轴一致 (s)
+PLANNING_OBSTACLE_T_HORIZON_S = 5.0
 
 # 决策类型
 class NudgeDecision:
@@ -159,11 +183,6 @@ def _get_obs_l_extent_at_s(obs: dict, s: float):
         return None
     return (min(l_vals), max(l_vals))
 
-
-def _intervals_overlap(a_lo: float, a_hi: float, b_lo: float, b_hi: float) -> bool:
-    return max(a_lo, b_lo) <= min(a_hi, b_hi) + K_ZERO_VAL
-
-
 def _merge_s_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """将 [lo,hi] 区间合并为有序、互不重叠的并集。"""
     if not intervals:
@@ -179,7 +198,7 @@ def _merge_s_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float
 
 
 def _path_bounds_from_two_elements(
-    elements, a_key, b_key, ego_s, obs_info_list,
+    a_key, b_key, ego_s, obs_info_list,
     road_left_l: float | None = None,
     road_right_l: float | None = None,
 ):
@@ -223,7 +242,10 @@ class VehiclePerception(Node):
     """车辆感知节点"""
 
     def __init__(self):
-        super().__init__('vehicle_perception')
+        super().__init__(
+            'vehicle_perception',
+            parameter_overrides=[Parameter('use_sim_time', value=True)],
+        )
 
         # 控制参数
         self.control_dt = 0.05  # 20Hz
@@ -256,7 +278,12 @@ class VehiclePerception(Node):
         self.borrow_opposing_lane = True
         self.borrow_revoke_emergency = False
         self.borrow_opposing_lane_prev = True
-        self.borrow_gate_warned_latched = False
+        self.borrow_judge_flag = False
+        # 借道 s 区间：障碍物 id -> (lo, hi)
+        self.borrow_interval_by_oid: dict[Any, tuple[float, float]] = {}
+
+        # speed_planner 发布的停车线（map 系线段，取中点投到本周期参考线）
+        self._latest_stop_line_path: Optional[Path] = None
 
         # 上周期 QP 解的缓存，用于判断复用条件和提供平滑初始状态
         self.prev_qp_solution = {
@@ -381,12 +408,50 @@ class VehiclePerception(Node):
             10,
         )
 
-        # QP XY 路径（供控制模块 Stanley 跟踪）
+        # QP XY 路径（优先使用 ego_trajectory）
         self.qp_xy_path_pub = self.create_publisher(
             Path,
             '/path_smoothing/qp_xy_path',
             10,
         )
+
+        # 局部规划路径（ego 处 s=0）
+        if LocalPlanningPath is not None:
+            self.local_planning_path_pub = self.create_publisher(
+                LocalPlanningPath,
+                '/planning/local_planning_path',
+                10,
+            )
+            self.ego_trajectory_pub = self.create_publisher(
+                EgoPlanningTrajectory,
+                '/planning/ego_trajectory',
+                10,
+            )
+            self.planning_speed_profile_sub = self.create_subscription(
+                PlanningSpeedProfile,
+                '/planning/speed_profile',
+                self.planning_speed_profile_callback,
+                10,
+            )
+        else:
+            self.local_planning_path_pub = None
+            self.ego_trajectory_pub = None
+            self.planning_speed_profile_sub = None
+
+        if PlanningObstacleArray is not None and PlanningObstacle is not None:
+            self.planning_obstacle_pub = self.create_publisher(
+                PlanningObstacleArray,
+                '/planning/planning_obstacles',
+                10,
+            )
+        else:
+            self.planning_obstacle_pub = None
+            self.get_logger().warn('PlanningObstacleArray 未找到，不发布 /planning/planning_obstacles')
+
+        self.create_subscription(Path, '/planning/stop_line', self._stop_line_path_callback, 10)
+
+        self._speed_profile_resampled: list[dict] | None = None
+        self._planning_speed_invalid = True
 
         # 状态变量：用于接收 path_smoother 的 update_index / update_points 更新参考线
         self.pending_update_index = None
@@ -427,17 +492,21 @@ class VehiclePerception(Node):
             self.current_waypoints = []
             self.waypoints_received = False
             self.last_nearest_idx = 0
+        self._latest_stop_line_path = None
         self._reset_borrow_state()
+        self._speed_profile_resampled = None
         self.get_logger().info(
             f"{CYAN}✓ 感知：已清空路径与 QP 缓存{RESET}"
         )
+
+    def _stop_line_path_callback(self, msg: Path) -> None:
+        self._latest_stop_line_path = msg
 
     def _reset_borrow_state(self) -> None:
         """初始位姿重置等场景恢复借道状态默认。"""
         self.borrow_opposing_lane = True
         self.borrow_revoke_emergency = False
         self.borrow_opposing_lane_prev = True
-        self.borrow_gate_warned_latched = False
 
     def _sync_borrow_at_path_boundary_start(
         self, obs_info_list: list, has_considered_obs: bool
@@ -451,6 +520,10 @@ class VehiclePerception(Node):
             self.borrow_revoke_emergency = False
             self.borrow_opposing_lane_prev = False
 
+        else:
+            self.borrow_opposing_lane = True
+            self.borrow_opposing_lane_prev = True
+
     def _finalize_borrow_after_path_boundary(self, borrow_false_emergency: bool) -> None:
         """紧急撤销消费后清除 borrow_revoke_emergency；刷新 prev 供下周期边沿检测。"""
         if borrow_false_emergency:
@@ -460,7 +533,7 @@ class VehiclePerception(Node):
     @staticmethod
     def _effective_road_left_l(
         ego_s: float,
-        union_merged: list[tuple[float, float]],
+        union_merged: tuple[float, float],
         borrow_allowed: bool,
         has_considered_obs: bool,
     ) -> float:
@@ -470,9 +543,10 @@ class VehiclePerception(Node):
         """
         if not has_considered_obs or not borrow_allowed:
             return ROAD_LEFT_BOUNDARY_L_EGO
-        for lo, hi in union_merged:
-            if lo - K_ZERO_VAL <= ego_s <= hi + K_ZERO_VAL:
-                return ROAD_LEFT_BOUNDARY_L_FULL
+        lo, hi = union_merged
+        # TODO: 需要考虑右借道障碍物的影响
+        if lo - K_ZERO_VAL <= ego_s <= hi + K_ZERO_VAL:
+            return ROAD_LEFT_BOUNDARY_L_FULL
         return ROAD_LEFT_BOUNDARY_L_EGO
 
     def ego_info_callback(self, msg):
@@ -578,25 +652,6 @@ class VehiclePerception(Node):
         self.vehicle_max_steering_angle = 0.6
         self.vehicle_info_received = True
 
-    # TODO: remove this after testing
-    def _get_or_assign_vehicle_id(self, obj_id: int) -> str:
-        """
-        根据首次扫描顺序，将数值型 Object.id 映射为自定义的 vehicle_id 字符串。
-        映射一旦建立，在节点生命周期内保持不变。
-        """
-        # 已有映射则直接返回
-        if obj_id in self.object_id_map:
-            return self.object_id_map[obj_id]
-
-        # 还没有映射，则按顺序分配一个尚未使用的自定义 ID
-        for name in CUSTOM_OBSTACLE_IDS:
-            if name not in self.object_id_map.values():
-                self.object_id_map[obj_id] = name
-                return name
-
-        # 自定义 ID 已用完：退回用原始数值字符串
-        return str(obj_id)
-
     def waypoints_callback(self, msg):
         """路径点回调"""
         waypoints = []
@@ -656,6 +711,257 @@ class VehiclePerception(Node):
         # FIXME：检查object返回的数据是否正常，为什么boundingbox异常，是否是中点的问题？
         self.latest_objects = msg
 
+    def planning_speed_profile_callback(self, msg: PlanningSpeedProfile):
+        if PlanningSpeedProfile is None:
+            return
+        ok, resampled = self._validate_and_resample_speed_profile(msg)
+        self._planning_speed_invalid = not ok
+        if ok:
+            self._speed_profile_resampled = resampled
+        else:
+            self._speed_profile_resampled = None
+
+    def _validate_and_resample_speed_profile(
+        self, msg: PlanningSpeedProfile
+    ) -> tuple[bool, list[dict] | None]:
+        """返回 (是否有效, 重采样后的点列表 dict: t,s,v,a,da)。"""
+        pts = list(msg.points)
+        if len(pts) < 2:
+            self.get_logger().error("SpeedProfile 点数不足")
+            return False, None
+        pts.sort(key=lambda p: p.t)
+        if abs(pts[0].t) > K_ZERO_VAL:
+            self.get_logger().error("SpeedProfile 首点 t 必须为 0")
+            return False, None
+        dt = PLANNING_SPEED_PROFILE_RESAMPLE_DT_S
+        t_end = PLANNING_SPEED_PROFILE_T_HORIZON_S
+        if pts[-1].t + K_ZERO_VAL < t_end:
+            self.get_logger().error(
+                f"SpeedProfile 末点 t={pts[-1].t:.3f} 必须 ≥ {t_end}s"
+            )
+            return False, None
+        # 丢弃与上一点间隔 < dt 的中间点（保留首点）
+        thinned: list[PlanningSpeedPoint] = [pts[0]]
+        for p in pts[1:]:
+            if p.t - thinned[-1].t >= dt - 1e-9:
+                thinned.append(p)
+        if thinned[-1].t + K_ZERO_VAL < t_end:
+            thinned.append(pts[-1])
+        ta = np.array([p.t for p in thinned], dtype=float)
+        sa = np.array([p.s for p in thinned], dtype=float)
+        va = np.array([p.v for p in thinned], dtype=float)
+        aa = np.array([p.a for p in thinned], dtype=float)
+        da = np.array([p.da for p in thinned], dtype=float)
+        t_grid = np.arange(0.0, t_end + 1e-9, dt)
+        out: list[dict] = []
+        for tg in t_grid:
+            out.append(
+                {
+                    "t": float(tg),
+                    "s": float(np.interp(tg, ta, sa)),
+                    "v": float(np.interp(tg, ta, va)),
+                    "a": float(np.interp(tg, ta, aa)),
+                    "da": float(np.interp(tg, ta, da)),
+                }
+            )
+        return True, out
+
+    def _qp_frenet_to_xy_list(
+        self,
+        s_qp,
+        l_sol,
+        accumulated_s: np.ndarray,
+        reference_path_segment: np.ndarray,
+    ) -> list[tuple[float, float]]:
+        xy_points: list[tuple[float, float]] = []
+        acc_s = np.asarray(accumulated_s, dtype=float)
+        pts = np.asarray(reference_path_segment, dtype=float)
+        for si, li in zip(s_qp, l_sol):
+            if si <= acc_s[0]:
+                idx = 0
+                t = 0.0
+            elif si >= acc_s[-1]:
+                idx = len(acc_s) - 2
+                t = 1.0
+            else:
+                idx = int(np.searchsorted(acc_s, si)) - 1
+                idx = max(0, min(idx, len(acc_s) - 2))
+                ds = acc_s[idx + 1] - acc_s[idx]
+                t = 0.0 if abs(ds) < 1e-6 else float((si - acc_s[idx]) / ds)
+            p0 = pts[idx]
+            p1 = pts[idx + 1]
+            seg = p1 - p0
+            seg_len = np.linalg.norm(seg)
+            if seg_len < 1e-6:
+                base_xy = p0
+                theta = 0.0
+            else:
+                base_xy = p0 + t * seg
+                theta = math.atan2(seg[1], seg[0])
+            nx = -math.sin(theta)
+            ny = math.cos(theta)
+            x = float(base_xy[0] + li * nx)
+            y = float(base_xy[1] + li * ny)
+            xy_points.append((x, y))
+        return xy_points
+
+    def _truncate_polyline_at_ego(
+        self, xy_points: list[tuple[float, float]]
+    ) -> list[tuple[float, float]]:
+        """以自车当前位置在折线上的垂足为起点，丢弃前方之前的路径点；非复用路径若已在首点可近似不变。"""
+        if len(xy_points) < 2:
+            return list(xy_points)
+        pts = np.array(xy_points, dtype=float)
+        ego = np.array([self.current_x, self.current_y], dtype=float)
+        best_d = float("inf")
+        best_idx = 0
+        best_foot = pts[0].copy()
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            seg = p1 - p0
+            slen = float(np.linalg.norm(seg))
+            if slen < 1e-9:
+                continue
+            u = seg / slen
+            rel = ego - p0
+            proj = float(np.clip(np.dot(rel, u), 0.0, slen))
+            foot = p0 + proj * u
+            d = float(np.linalg.norm(ego - foot))
+            if d < best_d:
+                best_d = d
+                best_idx = i
+                best_foot = foot
+        foot_xy = (float(best_foot[0]), float(best_foot[1]))
+        tail = [(float(p[0]), float(p[1])) for p in pts[best_idx + 1 :]]
+        if not tail:
+            return [foot_xy]
+        if (tail[0][0] - foot_xy[0]) ** 2 + (tail[0][1] - foot_xy[1]) ** 2 < K_ZERO_VAL ** 2:
+            return [foot_xy] + tail[1:]
+        return [foot_xy] + tail
+
+    def _xy_list_to_planning_path_points(
+        self, xy_seq: list[tuple[float, float]]
+    ) -> list:
+        """构造 PlanningPathPoint 列表，s 从 0 起算，theta 沿路径切向。"""
+        if PlanningPathPoint is None or len(xy_seq) == 0:
+            return []
+        n = len(xy_seq)
+        s_acc = [0.0]
+        for i in range(1, n):
+            dx = xy_seq[i][0] - xy_seq[i - 1][0]
+            dy = xy_seq[i][1] - xy_seq[i - 1][1]
+            s_acc.append(s_acc[-1] + math.hypot(dx, dy))
+        out = []
+        for i in range(n):
+            if i < n - 1:
+                th = math.atan2(
+                    xy_seq[i + 1][1] - xy_seq[i][1],
+                    xy_seq[i + 1][0] - xy_seq[i][0],
+                )
+            elif out:
+                th = out[-1].theta
+            else:
+                th = float(self.current_yaw)
+            pp = PlanningPathPoint()
+            pp.x = float(xy_seq[i][0])
+            pp.y = float(xy_seq[i][1])
+            pp.theta = float(th)
+            pp.s = float(s_acc[i])
+            out.append(pp)
+        if len(out) >= 2:
+            out[-1].theta = out[-2].theta
+        return out
+
+    def _interpolate_path_point_at_s(self, path_pts: list, s_query: float):
+        """path_pts: PlanningPathPoint 按 s 递增；返回 (x,y,theta)。"""
+        if not path_pts:
+            return None
+        s_query = max(0.0, min(float(s_query), path_pts[-1].s))
+        if s_query <= path_pts[0].s + K_ZERO_VAL:
+            p = path_pts[0]
+            return p.x, p.y, p.theta
+        for i in range(len(path_pts) - 1):
+            p0, p1 = path_pts[i], path_pts[i + 1]
+            if p0.s - K_ZERO_VAL <= s_query <= p1.s + K_ZERO_VAL:
+                ds = p1.s - p0.s
+                if ds < K_ZERO_VAL:
+                    return p0.x, p0.y, p0.theta
+                r = (s_query - p0.s) / ds
+                x = p0.x + r * (p1.x - p0.x)
+                y = p0.y + r * (p1.y - p0.y)
+                th = p0.theta + r * (p1.theta - p0.theta)
+                return float(x), float(y), float(th)
+        p = path_pts[-1]
+        return p.x, p.y, p.theta
+
+    def _publish_local_planning_and_trajectory(
+        self, planning_path_pts: list, stamp
+    ) -> None:
+        """发布 LocalPlanningPath、nav Path、EgoPlanningTrajectory"""
+        if (
+            self.local_planning_path_pub is None
+            or LocalPlanningPath is None
+            or not planning_path_pts
+        ):
+            return
+        half_len = max(self.vehicle_length, 1.5) * 0.5
+        corridor_L = float(planning_path_pts[-1].s) + half_len
+        lp = LocalPlanningPath()
+        lp.header.frame_id = "map"
+        lp.header.stamp = stamp
+        lp.points = planning_path_pts
+        lp.corridor_length_s = corridor_L
+        self.local_planning_path_pub.publish(lp)
+
+        if self.qp_xy_path_pub is not None:
+            path_msg = Path()
+            path_msg.header = lp.header
+            for p in planning_path_pts:
+                ps = PoseStamped()
+                ps.header = path_msg.header
+                ps.pose.position.x = p.x
+                ps.pose.position.y = p.y
+                ps.pose.position.z = 0.0
+                qx, qy, qz, qw = self._yaw_to_quat(p.theta)
+                ps.pose.orientation.x = qx
+                ps.pose.orientation.y = qy
+                ps.pose.orientation.z = qz
+                ps.pose.orientation.w = qw
+                path_msg.poses.append(ps)
+            self.qp_xy_path_pub.publish(path_msg)
+
+        if self._planning_speed_invalid or self._speed_profile_resampled is None:
+            return
+        path_max_s = planning_path_pts[-1].s
+        traj = EgoPlanningTrajectory()
+        traj.header = lp.header
+        # warned_overshoot = False
+        for sp in self._speed_profile_resampled:
+            s_raw = sp["s"]
+            s_clamped = min(s_raw, path_max_s)
+            xy_th = self._interpolate_path_point_at_s(planning_path_pts, s_clamped)
+            if xy_th is None:
+                continue
+            x, y, th = xy_th
+            tp = PlanningTrajectoryPoint()
+            tp.x, tp.y, tp.theta, tp.s = x, y, th, s_clamped
+            tp.v = float(sp["v"])
+            tp.a = float(sp["a"])
+            tp.t = float(sp["t"])
+            tp.da = float(sp["da"])
+            if s_clamped >= path_max_s - K_ZERO_VAL:
+                tp.v = 0.0
+                tp.a = 0.0
+            traj.points.append(tp)
+        if self.ego_trajectory_pub is not None and traj.points:
+            self.ego_trajectory_pub.publish(traj)
+
+    @staticmethod
+    def _yaw_to_quat(yaw: float) -> tuple[float, float, float, float]:
+        half = yaw * 0.5
+        return 0.0, 0.0, math.sin(half), math.cos(half)
+
     def odom_callback(self, msg):
         """里程计回调 - 获取车辆位置和姿态"""
         pose = msg.pose.pose
@@ -675,8 +981,8 @@ class VehiclePerception(Node):
         if not self.waypoints_received or len(self.current_waypoints) == 0:
             return
 
-        # 1. 基于当前位姿和全局路径，搜索最近路径段索引（Stanley 风格）
-        nearest_idx = self._find_nearest_index_on_path()
+        # 1. 基于当前位姿和全局路径，搜索最近路径段索引（Stanley 风格）及垂足在该段上的弧长
+        nearest_idx, ego_seg_projection = self._find_nearest_index_on_path()
 
         # 2. 基于该最近索引截取局部参考线（首尾截断）
         reference_segment, start_idx, end_idx = self.get_reference_path_segment(nearest_idx)
@@ -687,7 +993,9 @@ class VehiclePerception(Node):
         self.publish_frenet_coordinates(reference_segment, nearest_idx)
 
         # 4. 发布SL边界（障碍物）与 PathBoundary
-        self.publish_sl_boundaries(reference_segment, nearest_idx, start_idx)
+        self.publish_sl_boundaries(
+            reference_segment, nearest_idx, start_idx, ego_seg_projection
+        )
 
     def get_reference_path_segment(self, center_idx: int):
         """
@@ -819,20 +1127,25 @@ class VehiclePerception(Node):
 
         return float(best_signed_dist)
 
-    def _find_nearest_index_on_path(self) -> int:
+    def _find_nearest_index_on_path(self) -> tuple[int, float]:
         """
         在 self.current_waypoints 上搜索当前车辆最近的路径段索引，
         逻辑参考 StanleyController.compute_steering 中最近段搜索。
+
+        返回：
+            nearest_idx: 最近线段起点在全局 waypoints 中的索引 i（段为 i→i+1）
+            ego_seg_projection: 自车垂足在该段上从起点沿前进方向的弧长（已 clip 到段内）
         """
         if len(self.current_waypoints) < 2:
             self.last_nearest_idx = 0
-            return 0
+            return 0, 0.0
 
         current_pos = np.array([self.current_x, self.current_y], dtype=float)
         n = len(self.current_waypoints)
 
-        min_dist = float('inf')
+        min_dist = float("inf")
         nearest_idx = self.last_nearest_idx
+        best_projection = 0.0
 
         # 仅在上一次附近窗口内搜索，加速计算
         min_search_idx = max(0, self.last_nearest_idx - 50)
@@ -859,11 +1172,33 @@ class VehiclePerception(Node):
             if dist < min_dist:
                 min_dist = dist
                 nearest_idx = i
+                best_projection = float(projection)
+
+        if min_dist == float("inf"):
+            nearest_idx = max(0, min(self.last_nearest_idx, n - 2))
+            start_point = np.array(self.current_waypoints[nearest_idx], dtype=float)
+            end_point = np.array(self.current_waypoints[nearest_idx + 1], dtype=float)
+            line_vec = end_point - start_point
+            line_len = float(np.linalg.norm(line_vec))
+            if line_len >= 1e-6:
+                line_unitvec = line_vec / line_len
+                vehicle_to_start = current_pos - start_point
+                best_projection = float(
+                    np.clip(np.dot(vehicle_to_start, line_unitvec), 0.0, line_len)
+                )
+            else:
+                best_projection = 0.0
 
         self.last_nearest_idx = nearest_idx
-        return nearest_idx
+        return nearest_idx, best_projection
 
-    def publish_sl_boundaries(self, reference_path_segment, nearest_idx: int, start_idx: int):
+    def publish_sl_boundaries(
+        self,
+        reference_path_segment,
+        nearest_idx: int,
+        start_idx: int,
+        ego_seg_projection: float,
+    ):
         """
         计算并发布障碍物的SL边界
 
@@ -871,8 +1206,9 @@ class VehiclePerception(Node):
         reference_path_segment: 参考线路径段
         nearest_idx: 自车在全局路径上的最近段索引
         start_idx: 参考线段在全局路径中的起始索引
+        ego_seg_projection: 自车在全局路径最近段上的垂足弧长
         """
-        if self.sl_boundary_array_pub is None or math_utils is None:
+        if math_utils is None:
             return
 
         if len(reference_path_segment) < 2:
@@ -883,16 +1219,21 @@ class VehiclePerception(Node):
         )
         if seg_len_flag:
             self.get_logger().error(f"✗ 路径点距过小/退化，s 计算可能不准确")
-        # effective_backward = 自车到参考线段起点的弧长，裁剪掉假设后方 30m 的逻辑
-        local_idx = min(nearest_idx - start_idx, len(accumulated_s_raw) - 1)
-        local_idx = max(0, local_idx)
-        s_ego_raw = float(accumulated_s_raw[local_idx])
-        accumulated_s = accumulated_s_raw - s_ego_raw  # s=0 在自车位置
+        # 自车沿参考段弧长：最近段起点顶点 s + 段内垂足距离（与 stop_line 等 project 标尺一致）
+        n_raw = len(accumulated_s_raw)
+        j_seg = nearest_idx - int(start_idx)
+        j_seg = max(0, min(j_seg, n_raw - 2))
+        s_ego_raw = float(accumulated_s_raw[j_seg] + ego_seg_projection)
+        accumulated_s = accumulated_s_raw - s_ego_raw  # s=0 在自车垂足
 
         ego_xy = np.array([self.current_x, self.current_y], dtype=float)
 
+        planning_obstacles_list: list = []
+
         # 收集所有障碍物的SLBoundary（无障碍物时为空，仍会发布 PathBoundary 全车道）
         sl_boundaries_list = []
+        obj_is_static_by_id: dict[str, bool] = {}
+
         if self.latest_objects is not None and len(self.latest_objects.objects) > 0:
             for obj in self.latest_objects.objects:
                 # 障碍物中心
@@ -930,7 +1271,28 @@ class VehiclePerception(Node):
                 # 计算4个二维角点（世界坐标）
                 corners_xy = self._compute_box_corners_2d(obj_xy, yaw, length, width)
 
-                # 计算SLBoundary
+                oid = str(obj.id)
+                try:
+                    vx = float(obj.twist.linear.x)
+                    vy = float(obj.twist.linear.y)
+                except (AttributeError, TypeError, ValueError):
+                    vx, vy = 0.0, 0.0
+                spd = math.hypot(vx, vy)
+                is_static = spd < OBS_STATIC_SPEED_THRESH_MPS
+
+                if PlanningObstacle is not None:
+                    po = PlanningObstacle()
+                    po.obstacle_id = oid
+                    po.is_static = is_static
+                    po.decision = (
+                        PlanningObstacle.DECISION_STATIC_NUDGE
+                        if is_static
+                        else PlanningObstacle.DECISION_DYN_FOLLOW
+                    )
+                    po.object = copy.deepcopy(obj)
+                    planning_obstacles_list.append(po)
+
+                # 计算SLBoundary（失败则仍保留 planning 条目，但不进入 PathBoundary 列表）
                 sl_boundary = self._compute_sl_boundary_for_box(
                     corners_xy,
                     reference_path_segment,
@@ -952,11 +1314,23 @@ class VehiclePerception(Node):
                 boundary_msg.end_l = sl_boundary["end_l"]
                 boundary_msg.boundary_s = sl_boundary["boundary_s"]
                 boundary_msg.boundary_l = sl_boundary["boundary_l"]
-                #boundary_msg.vehicle_id = str(obj.id)
-                # TODO: remove this after testing
-                boundary_msg.vehicle_id = self._get_or_assign_vehicle_id(obj.id)
+                boundary_msg.vehicle_id = oid
+                boundary_msg.decision = (
+                    PlanningObstacle.DECISION_STATIC_NUDGE
+                    if is_static
+                    else PlanningObstacle.DECISION_DYN_FOLLOW
+                )
+                obj_is_static_by_id[oid] = is_static
 
                 sl_boundaries_list.append(boundary_msg)
+
+        if self.planning_obstacle_pub is not None and PlanningObstacleArray is not None:
+            pam = PlanningObstacleArray()
+            pam.header.frame_id = 'map'
+            pam.header.stamp = self.get_clock().now().to_msg()
+            pam.t_horizon = float(PLANNING_OBSTACLE_T_HORIZON_S)
+            pam.obstacles = planning_obstacles_list
+            self.planning_obstacle_pub.publish(pam)
 
         # 一次性发布所有障碍物的SLBoundary数组
         if len(sl_boundaries_list) > 0 and self.sl_boundary_array_pub is not None:
@@ -970,7 +1344,7 @@ class VehiclePerception(Node):
         # 同时构建 id->obj_xy 的映射（从上面的循环结果中恢复，用于签名）
         obj_xy_map = {}  # oid -> (x, y) 世界坐标
         for obj in (self.latest_objects.objects if self.latest_objects else []):
-            oid = self._get_or_assign_vehicle_id(obj.id)
+            oid = str(obj.id)
             obj_xy = np.array([obj.pose.position.x, obj.pose.position.y], dtype=float)
             obj_xy_map[oid] = (float(obj_xy[0]), float(obj_xy[1]))
 
@@ -986,12 +1360,33 @@ class VehiclePerception(Node):
                 continue
             if b.end_l < ROAD_RIGHT_BOUNDARY_L - K_ZERO_VAL:
                 continue
-            # 当前阶段：全部参与考虑，决策统一向左 nudge（保留接口）
+
+            plan_dec = int(getattr(b, "decision", 0))
+            if plan_dec != PlanningObstacle.DECISION_STATIC_NUDGE:
+                continue
+
             consider = True
-            
-            # TODO: remove this after testing
-            
-            decision = NudgeDecision.LEFT_NUDGE
+
+            obj_xy_pair = obj_xy_map.get(oid, (None, None))
+            ox, oy = obj_xy_pair[0], obj_xy_pair[1]
+            if ox is None or oy is None:
+                continue
+            sl_center = self._xy_to_sl_ego(
+                np.array([ox, oy], dtype=float),
+                np.asarray(reference_path_segment, dtype=float),
+                np.asarray(accumulated_s, dtype=float),
+                mode="global",
+            )
+            if sl_center is None:
+                continue
+            _, obj_l = sl_center
+            d_left = abs(float(obj_l) - ROAD_LEFT_BOUNDARY_L_FULL)
+            d_right = abs(float(obj_l) - ROAD_RIGHT_BOUNDARY_L)
+            if d_left <= d_right + K_ZERO_VAL:
+                decision = NudgeDecision.RIGHT_NUDGE
+            else:
+                decision = NudgeDecision.LEFT_NUDGE
+
             ref_left_s, ref_left_l, ref_right_s, ref_right_l = _get_obs_ref_points_(
                 cs, cl, decision,
                 100, -100,
@@ -1009,9 +1404,45 @@ class VehiclePerception(Node):
                 "ref_right_s": ref_right_s,
                 "ref_right_l": ref_right_l,
                 "obj_xy": obj_xy_map.get(oid, (None, None)),
+                "is_static": obj_is_static_by_id.get(oid, False),
             })
+        stop_line_s_raw: Optional[float] = None
+        sl_path = self._latest_stop_line_path
+        if (
+            sl_path is not None
+            and len(sl_path.poses) >= 2
+            and math_utils is not None
+            and len(reference_path_segment) >= 2
+        ):
+            mx = 0.5 * (
+                float(sl_path.poses[0].pose.position.x)
+                + float(sl_path.poses[1].pose.position.x)
+            )
+            my = 0.5 * (
+                float(sl_path.poses[0].pose.position.y)
+                + float(sl_path.poses[1].pose.position.y)
+            )
+            mid = np.array([mx, my], dtype=float)
+            sl_mid = math_utils.project_xy_to_sl_polyline(
+                mid,
+                np.asarray(reference_path_segment, dtype=float),
+                accumulated_s_raw,
+                None,
+                None,
+                eps=K_ZERO_VAL,
+            )
+            if sl_mid is not None:
+                stop_line_s_raw = float(sl_mid[0])
+
         if self.path_boundary_pub is not None:
-            self._compute_and_publish_path_boundary(obs_info_list, kappas, accumulated_s, reference_path_segment)
+            self._compute_and_publish_path_boundary(
+                obs_info_list,
+                kappas,
+                accumulated_s,
+                reference_path_segment,
+                stop_line_s_raw=stop_line_s_raw,
+                s_ego_raw=s_ego_raw,
+            )
 
     def _compute_obs_signature(self, obs_info_list: list) -> str:
         """
@@ -1074,9 +1505,12 @@ class VehiclePerception(Node):
         4. 自车横向偏差在容差内
         5. ego_s 无跳变（防止换参考线等）
         """
+
+        # NOTE: 如果无需在plotter中显示求解路径，可以注释以下代码以允许QP复用，节省算力
+        return False
+
         prev = self.prev_qp_solution
         if not prev.get("path_boundary_valid", False):
-            
             return False
         if prev["s"] is None:
             return False
@@ -1143,7 +1577,7 @@ class VehiclePerception(Node):
             return (l_init, 0.0, 0.0)
 
         # 将本周期的 ego xy 投影到上周期的参考线上
-        ego_sl_res = self._xy_to_sl(ego_xy, prev_ref_seg, prev_acc_s)
+        ego_sl_res = self._xy_to_sl_ego(ego_xy, prev_ref_seg, prev_acc_s)
         if ego_sl_res is None:
             # 投影失败，使用当前 ego 的 l 值
             self.get_logger().warn("投影失败，使用当前 ego 的 l 值")
@@ -1165,21 +1599,24 @@ class VehiclePerception(Node):
 
         # 裁剪到当前 path_bound 范围内
         l_init = float(np.clip(l_ref, path_bound_lo, path_bound_hi))
-        # self.get_logger().warn(f"l_init: {l_init}, dl_ref: {dl_ref}, ddl_ref: {ddl_ref}")
-        # self.get_logger().warn("-----------------------------------")
 
         return (l_init, dl_ref, ddl_ref)
 
-    def _compute_and_publish_path_boundary(self, obs_info_list: list,
-                                           kappas: np.ndarray,
-                                           accumulated_s: np.ndarray,
-                                           reference_path_segment: np.ndarray):
+    def _compute_and_publish_path_boundary(
+        self,
+        obs_info_list: list,
+        kappas: np.ndarray,
+        accumulated_s: np.ndarray,
+        reference_path_segment: np.ndarray,
+        stop_line_s_raw: Optional[float] = None,
+        s_ego_raw: float = 0.0,
+    ):
         """根据当前 obs 列表计算 PathBoundary 并发布，并在前 30m 调用 QP 生成局部避障路径。
         支持 QP 解复用，仅在必要时重新计算。
         """
         # 计算当前 ego 的 SL 坐标（用于复用判断和后续计算）
         ego_xy = np.array([self.current_x, self.current_y], dtype=float)
-        ego_sl_res = self._xy_to_sl(ego_xy, reference_path_segment, accumulated_s)
+        ego_sl_res = self._xy_to_sl_ego(ego_xy, reference_path_segment, accumulated_s)
         if ego_sl_res is not None:
             current_ego_s, current_ego_l = ego_sl_res[0], ego_sl_res[1]
         else:
@@ -1191,34 +1628,54 @@ class VehiclePerception(Node):
         has_considered_obs = any(o.get("consider", False) for o in obs_info_list)
         self._sync_borrow_at_path_boundary_start(obs_info_list, has_considered_obs)
 
-        v = max(float(self.current_speed), 0.0)
-        trigger_dist = v * BORROW_TRIGGER_TIME_S + BORROW_TRIGGER_EXTRA_M
-
-        borrow_union: list[tuple[float, float]] = []
+        # TODO: 当前仅考虑静态障碍物，后期加上动态障碍物考虑是否需要超车或对向车变道
         for o in obs_info_list:
-            if not o.get("consider", False):
+            # 仅考虑向左侧借道（当前道路规则限制）
+            if (not o.get("consider", False) or not o.get("is_static", False)
+                or o["decision"] != NudgeDecision.LEFT_NUDGE):
                 continue
+            oid = o["id"]
+            if oid in self.borrow_interval_by_oid:
+                del self.borrow_interval_by_oid[oid]
+            if float(o["end_s"]) + BORROW_S_PAD_REAR < current_ego_s:
+                continue
+
+            # TODO: 这里纵向设计成矩形段落，非常容易导致QP求解失败，需要设计成更合理的梯形段落
             lo = float(o["start_s"]) - BORROW_S_PAD_FRONT
             hi = float(o["end_s"]) + BORROW_S_PAD_REAR
-            borrow_union.append((lo, hi))
-        union_merged = _merge_s_intervals(borrow_union)
+            self.borrow_interval_by_oid[oid] = (lo, hi)
+        union_merged = _merge_s_intervals(list(self.borrow_interval_by_oid.values()))
 
-        # TODO: 在时空联合规划/对向安全确认后，最小化 FULL 左边界与并集区间占用（仅必要 s 段借道）
-        needs_trigger = any(
-            o.get("consider", False) and float(o["start_s"]) <= trigger_dist + K_ZERO_VAL
+        if not self.borrow_judge_flag:
+            self.borrow_judge_flag = (stop_line_s_raw is not None
+            and (float(stop_line_s_raw) - float(s_ego_raw)) <= JUDGE_DISTANCE_BEFORE_STOP_LINE)
+        # 有前方相关的静态 consider 障碍时允许借道拓展
+        static_obs_condition = any(
+            o.get("consider", False)
+            and o.get("is_static", False)
+            and len(union_merged) > 0 and union_merged[0][1] >= -K_ZERO_VAL
+            and self.borrow_judge_flag
             for o in obs_info_list
         )
 
-        borrow_now = self.borrow_opposing_lane
+        if not static_obs_condition:
+            self.borrow_judge_flag = False
+
+        # TODO: self.borrow_opposing_lane 后期由stop决策和当前borrow路况判断共同决定
+        borrow_now = self.borrow_opposing_lane and static_obs_condition
         emergency_revoke_flag = self.borrow_revoke_emergency
 
         borrow_false_emergency = (
             self.borrow_opposing_lane_prev and not borrow_now and emergency_revoke_flag
         )
-        # borrow_false_normal = (
-        #     self.borrow_opposing_lane_prev and not borrow_now and not emergency_revoke_flag
-        # )
-        borrow_gate_blocked = needs_trigger and not borrow_now and has_considered_obs
+
+        # PathBoundary 最终 valid：先根据借道/门控定下「后置」无效项，采样循环结束后再与几何 valid 合并
+        activate_AEB = False
+        if borrow_false_emergency:
+            activate_AEB = True
+            self.get_logger().error(
+                "借道撤销（紧急）：PathBoundary 将判无效；确认安全后设 borrow_revoke_emergency=False，再设 borrow_opposing_lane"
+            )
 
         # s 从 ego 位置(0) 到局部参考线终点的弧长，起点/终点时做裁剪
         s_min_eff = 0.0
@@ -1226,6 +1683,13 @@ class VehiclePerception(Node):
             REFERENCE_LINE_HORIZON,
             max(0.0, float(accumulated_s[-1])) if len(accumulated_s) > 0 else REFERENCE_LINE_HORIZON
         )
+        if stop_line_s_raw is not None and not borrow_now:
+            s_stop_ego = float(stop_line_s_raw) - float(s_ego_raw)
+            if s_stop_ego > K_ZERO_VAL:
+                # 一定要加上PATH_BOUNDARY_S_RESOLUTION，否则无法包含stop_line在内的规划！！！
+                # 调试一大圈之后才发现，因此导致之前stop_line投影一直离奇不稳定，出现一系列问题
+                # TODO: 根因尚未明晰，后续排查
+                s_max_eff = min(s_max_eff, s_stop_ego + PATH_BOUNDARY_S_RESOLUTION)
         s_samples = np.arange(s_min_eff, s_max_eff + K_ZERO_VAL, PATH_BOUNDARY_S_RESOLUTION)
         if len(s_samples) == 0:
             self._finalize_borrow_after_path_boundary(borrow_false_emergency)
@@ -1238,18 +1702,18 @@ class VehiclePerception(Node):
         raw_l_upper_list = []
         raw_l_lower_list = []
         valid = True
-        prev_two = None
 
         for ego_s in s_samples:
             active = [
                 o for o in obs_info_list
-                if o["consider"] and o["start_s"] <= ego_s <= o["end_s"]
+                if o["consider"] and o["start_s"] <= ego_s <= o["end_s"] and o.get("is_static", False)
             ]
-            rl = self._effective_road_left_l(
-                ego_s, union_merged, borrow_now, has_considered_obs,
-            )
-            road_left = (rl, rl, "road_left", None)
-            road_right = (ROAD_RIGHT_BOUNDARY_L, ROAD_RIGHT_BOUNDARY_L, "road_right", None)
+            if len(union_merged) > 0:
+                rl = self._effective_road_left_l(
+                    ego_s, union_merged[0], borrow_now, has_considered_obs
+                )
+            else:
+                rl = ROAD_LEFT_BOUNDARY_L_EGO
             # 先只对障碍物内部排序（当前 s 下无 l 投影的 obs 不参与）
             obs_elements = []
             for o in active:
@@ -1258,200 +1722,97 @@ class VehiclePerception(Node):
                     continue
                 l_lo, l_hi = ext
                 obs_elements.append((l_lo, l_hi, o["id"], o))
-            # 按 l_upper 从大到小排序
             obs_elements.sort(key=lambda x: x[1], reverse=True)
 
-            elements = [road_left] + obs_elements + [road_right]
-
-            # 只保留 obs 的决策，按 l_upper 从大到小
-            obs_order = [(e[2], e[3], e[0], e[1]) for e in elements if e[3] is not None]
-            decisions = [item[1]["decision"] for item in obs_order]
+            decisions = [t[3]["decision"] for t in obs_elements]
             n_left = sum(1 for d in decisions if d == NudgeDecision.LEFT_NUDGE)
             n_right = sum(1 for d in decisions if d == NudgeDecision.RIGHT_NUDGE)
-            change_count = 0
-            for i in range(len(decisions) - 1):
-                if decisions[i] != decisions[i + 1]:
-                    change_count += 1
+            change_count = sum(
+                1 for i in range(len(decisions) - 1) if decisions[i] != decisions[i + 1]
+            )
             if change_count > 1:
                 valid = False
                 self.get_logger().error(
                     "PathBoundary: 决策类型变化超过一次，请求停车"
                 )
                 break
-            first_obs_decision = decisions[0] if decisions else None
-            if first_obs_decision == NudgeDecision.LEFT_NUDGE and n_right > 0:
+            if decisions and decisions[0] == NudgeDecision.LEFT_NUDGE and n_right > 0:
                 valid = False
                 self.get_logger().error(
                     "PathBoundary: 第一个 obs 为左 nudge 但存在右 nudge，请求停车"
                 )
                 break
 
-            # 选取两个元素
-            need_recompute = True
-            if prev_two is not None:
-                a_key, b_key = prev_two
-                path_lo_old, path_hi_old = _path_bounds_from_two_elements(
-                    elements, a_key, b_key, ego_s, obs_info_list,
-                    road_left_l=rl, road_right_l=ROAD_RIGHT_BOUNDARY_L,
-                )
-                if path_lo_old is None:
-                    need_recompute = True
+            fallback_lower = None
+            fallback_upper = None
+            if change_count == 1:
+                last_right_idx = None
+                first_left_idx = None
+                for i, (_, _, _, obs) in enumerate(obs_elements):
+                    if obs["decision"] == NudgeDecision.RIGHT_NUDGE:
+                        last_right_idx = i
+                    if first_left_idx is None and obs["decision"] == NudgeDecision.LEFT_NUDGE:
+                        first_left_idx = i
+                if last_right_idx is not None and first_left_idx is not None:
+                    er, el = obs_elements[last_right_idx], obs_elements[first_left_idx]
+                    fallback_upper, fallback_lower = er[0], el[1]
+                    a_key, b_key = er[2], el[2]
                 else:
-                    def _obs_ended(obs_list, key, s):
-                        if key in ("road_left", "road_right"):
-                            return False
-                        for o in obs_list:
-                            if o["id"] == key:
-                                return s > o["end_s"]
-                        return False
-                    left_obs_ended = _obs_ended(obs_info_list, a_key, ego_s) or _obs_ended(obs_info_list, b_key, ego_s)
-                    if left_obs_ended:
-                        need_recompute = True
-                    else:
-                        for o in active:
-                            if o["id"] == a_key or o["id"] == b_key:
-                                continue
-                            ext = _get_obs_l_extent_at_s(o, ego_s)
-                            if ext is None:
-                                continue
-                            l_lo, l_hi = ext
-                            if _intervals_overlap(
-                                path_lo_old, path_hi_old, l_lo, l_hi
-                            ):
-                                need_recompute = True
-                                break
-                        if not need_recompute:
-                            # 先按道路几何边界裁剪
-                            path_lo_old = max(path_lo_old, ROAD_RIGHT_BOUNDARY_L)
-                            path_hi_old = min(path_hi_old, rl)
-                            # 保存收缩前（仅考虑道路与障碍物收缩）的 PathBoundary
-                            raw_s_list.append(ego_s)
-                            raw_l_lower_list.append(path_lo_old)
-                            raw_l_upper_list.append(path_hi_old)
-                            # 再施加 ADC bound 与横向 buffer，得到 ego 中心可行域
-                            shrink = self.ego_half_width + EGO_LAT_BUFFER
-                            adc_lo = path_lo_old + shrink
-                            adc_hi = path_hi_old - shrink
-                            if adc_hi <= adc_lo:
-                                if ego_s <= BLOCK_STOP_DISTANCE:
-                                    valid = False
-                                    self.get_logger().error(
-                                        f"PathBoundary: s={ego_s:.2f} 处 ADC 收缩后无可行走廊，判定 blocked（≤{BLOCK_STOP_DISTANCE:.1f}m 内）"
-                                    )
-                                    # self.get_logger().error(f"path_lo_old: {path_lo_old:.2f}, path_hi_old: {path_hi_old:.2f}, shrink: {shrink:.2f}, adc_lo: {adc_lo:.2f}, adc_hi: {adc_hi:.2f}")
-                                    break
-                                else:
-                                    # 远处先仅告警，不立即判定整条 PathBoundary 失效
-                                    self.get_logger().warn(
-                                        f"PathBoundary: s={ego_s:.2f} 处 ADC 收缩后无可行走廊，暂不 blocked（>{BLOCK_STOP_DISTANCE:.1f}m）"
-                                    )
-                                    # self.get_logger().error(f"path_lo_old: {path_lo_old:.2f}, path_hi_old: {path_hi_old:.2f}, shrink: {shrink:.2f}, adc_lo: {adc_lo:.2f}, adc_hi: {adc_hi:.2f}")
-                                    continue
-                            s_list.append(ego_s)
-                            l_upper_list.append(adc_hi)
-                            l_lower_list.append(adc_lo)
-                            continue
+                    a_key, b_key = "road_left", "road_right"
+            elif n_left > 0:
+                a_key, b_key = "road_left", obs_elements[0][2]
+            elif n_right > 0:
+                a_key, b_key = obs_elements[-1][2], "road_right"
+            else:
+                a_key, b_key = "road_left", "road_right"
 
-            if need_recompute:
-                # 当 change_count==1 且两个 obs 都在 obs_elements 时，
-                # 若某条边的 3 点插值在当前 s 不覆盖（_get_obs_edge_l_at_s 返回 None），_path_bounds_from_two_elements 会返回 (None, None)
-                # 所以需要记录其 l 范围做 fallback，避免误用全道路
-                fallback_lower = None
-                fallback_upper = None
-                if change_count == 1:
-                    last_right_idx = None
-                    first_left_idx = None
-                    for i, (_, obs, l_lo, l_hi) in enumerate(obs_order):
-                        if obs["decision"] == NudgeDecision.RIGHT_NUDGE:
-                            last_right_idx = i
-                        if first_left_idx is None and obs["decision"] == NudgeDecision.LEFT_NUDGE:
-                            first_left_idx = i
-                    if last_right_idx is not None and first_left_idx is not None:
-                        elem_right = elements[1 + last_right_idx]
-                        elem_left = elements[1 + first_left_idx]
-                        fallback_upper = elem_right[0]
-                        fallback_lower = elem_left[1]
-                        prev_two = (elem_right[2], elem_left[2])
-                    else:
-                        path_upper = rl
-                        path_lower = ROAD_RIGHT_BOUNDARY_L
-                        prev_two = ("road_left", "road_right")
-                else:
-                    if n_left > 0:
-                        first_obs = obs_order[0]
-                        path_upper = rl
-                        path_lower = first_obs[3]
-                        prev_two = ("road_left", first_obs[1]["id"])
-                    elif n_right > 0:
-                        last_obs = obs_order[-1]
-                        path_upper = last_obs[2]
-                        path_lower = ROAD_RIGHT_BOUNDARY_L
-                        prev_two = (last_obs[1]["id"], "road_right")
-                    else:
-                        path_upper = rl
-                        path_lower = ROAD_RIGHT_BOUNDARY_L
-                        prev_two = ("road_left", "road_right")
-
-                path_lower, path_upper = _path_bounds_from_two_elements(
-                    elements, prev_two[0], prev_two[1], ego_s, obs_info_list,
-                    road_left_l=rl, road_right_l=ROAD_RIGHT_BOUNDARY_L,
-                )
-
-                if path_upper is None or path_lower is None:
-                    # n_left>0 or n_right>0 时不应回退到全道路；change_count==1 且已选出两障时用 extent 做 fallback
-                    if fallback_lower is not None and fallback_upper is not None:
-                        path_lower = fallback_lower
-                        path_upper = fallback_upper
-                    else:
-                        path_upper = rl
-                        path_lower = ROAD_RIGHT_BOUNDARY_L
-
-                # 先按道路边界裁剪
-                path_lower = max(path_lower, ROAD_RIGHT_BOUNDARY_L)
-                path_upper = min(path_upper, rl)
-                # 保存收缩前（仅考虑道路与障碍物收缩）的 PathBoundary
-                raw_s_list.append(ego_s)
-                raw_l_lower_list.append(path_lower)
-                raw_l_upper_list.append(path_upper)
-                # 再施加 ADC bound 和横向 buffer
-                shrink = self.ego_half_width + EGO_LAT_BUFFER
-                adc_lo = path_lower + shrink
-                adc_hi = path_upper - shrink
-                if adc_hi <= adc_lo:
-                    if ego_s <= BLOCK_STOP_DISTANCE:
-                        valid = False
-                        self.get_logger().error(
-                            f"PathBoundary: s={ego_s:.2f} 处 ADC 收缩后无可行走廊，判定 blocked（≤{BLOCK_STOP_DISTANCE:.1f}m 内）"
-                        )
-                        # self.get_logger().error(f"path_lo_old: {path_lower:.2f}, path_hi_old: {path_upper:.2f}, shrink: {shrink:.2f}, adc_lo: {adc_lo:.2f}, adc_hi: {adc_hi:.2f}")
-                        break
-                    else:
-                        self.get_logger().warn(
-                            f"PathBoundary: s={ego_s:.2f} 处 ADC 收缩后无可行走廊，暂不 blocked（>{BLOCK_STOP_DISTANCE:.1f}m）"
-                        )
-                        # self.get_logger().error(f"path_lo_old: {path_lower:.2f}, path_hi_old: {path_upper:.2f}, shrink: {shrink:.2f}, adc_lo: {adc_lo:.2f}, adc_hi: {adc_hi:.2f}")
-                        continue
-
-                s_list.append(ego_s)
-                l_upper_list.append(adc_hi)
-                l_lower_list.append(adc_lo)
-
-        if borrow_false_emergency:
-            valid = False
-            self.get_logger().error(
-                "借道撤销（紧急）：PathBoundary 无效；确认安全后设 borrow_revoke_emergency=False，再设 borrow_opposing_lane"
+            path_lower, path_upper = _path_bounds_from_two_elements(
+                a_key, b_key, ego_s, obs_info_list,
+                road_left_l=rl, road_right_l=ROAD_RIGHT_BOUNDARY_L,
             )
-        elif borrow_gate_blocked:
+
+            if path_upper is None or path_lower is None:
+                # n_left>0 or n_right>0 时不应回退到全道路；change_count==1 且已选出两障时用 extent 做 fallback
+                if fallback_lower is not None and fallback_upper is not None:
+                    path_lower = fallback_lower
+                    path_upper = fallback_upper
+                else:
+                    path_upper = rl
+                    path_lower = ROAD_RIGHT_BOUNDARY_L
+
+            # 先按道路边界裁剪
+            path_lower = max(path_lower, ROAD_RIGHT_BOUNDARY_L)
+            path_upper = min(path_upper, rl)
+            shrink = self.ego_half_width + EGO_LAT_BUFFER
+            adc_lo = path_lower + shrink
+            adc_hi = path_upper - shrink
+            if adc_hi <= adc_lo:
+                if ego_s <= BLOCK_STOP_DISTANCE and stop_line_s_raw is None:
+                    valid = False
+                    self.get_logger().error(
+                        f"PathBoundary: s={ego_s:.2f} 处 ADC 收缩后无可行走廊且无stop_line，判定 blocked（≤{BLOCK_STOP_DISTANCE:.1f}m 内）"
+                    )
+                break
+
+            raw_s_list.append(ego_s)
+            raw_l_lower_list.append(path_lower)
+            raw_l_upper_list.append(path_upper)
+            s_list.append(ego_s)
+            l_upper_list.append(adc_hi)
+            l_lower_list.append(adc_lo)
+
+        if activate_AEB:
             valid = False
-            if not self.borrow_gate_warned_latched:
-                self.get_logger().warn(
-                    f"借道未允许且障碍已进入触发窗口 (≤{trigger_dist:.1f}m)，PathBoundary 无效，原地等待 borrow_opposing_lane=True"
-                )
-                self.borrow_gate_warned_latched = True
-        else:
-            self.borrow_gate_warned_latched = False
-        #     if borrow_false_normal:
-        #         self.get_logger().info("借道结束（正常）：左边界收紧至本向车道")
+
+        stop_line_gate_invalid = (
+            stop_line_s_raw is not None
+            and (float(stop_line_s_raw) - float(s_ego_raw)) <= JUDGE_DISTANCE_BEFORE_STOP_LINE
+            and not borrow_now
+        )
+
+        if stop_line_gate_invalid:
+            self.get_logger().info(f"stop_line_gate_invalid, stop_line_s_raw: {stop_line_s_raw}, s_ego_raw: {s_ego_raw}")
+            # valid = False
 
         self._finalize_borrow_after_path_boundary(borrow_false_emergency)
 
@@ -1473,8 +1834,9 @@ class VehiclePerception(Node):
 
         # 在前 30m 运行局部 QP，生成 Frenet QP 路径并通过 Path 更新控制端 waypoints
         try:
-            if not valid:
-                return
+            # NOTE: 当前不再强制要求 PathBoundary 有效，避免冷启动失效，valid为false时控制会触发停车
+            # if not valid:
+            #     return
             if len(s_list) == 0:
                 return
             # 只取 0–30m 区间
@@ -1521,7 +1883,6 @@ class VehiclePerception(Node):
                 # 初始状态：从上周期 QP 解插值获取 (l, dl, ddl)，实现平滑衔接
                 # 将本周期的 ego xy 投影到上周期的参考线上获取真实 ego_s，再插值 QP 解
                 # TODO: 当前相当于是估计值，后续需要融合传感器数值进行卡尔曼滤波获得更精确的初值
-                # self.get_logger().info("重新求解中")
                 lo0, hi0 = path_bound_qp[0, 0], path_bound_qp[0, 1]
                 l_init, dl_init, ddl_init = self._get_init_state_from_prev_solution(
                     ego_xy=ego_xy,  # 本周期的 ego xy 投影到上周期的参考线
@@ -1548,20 +1909,9 @@ class VehiclePerception(Node):
                 )
                 def _qp_debug(**kw):
                     reason = kw.get("reason", "?")
-                    v = kw.get("v_current", 0.0)
                     self.get_logger().error(
-                        f"QP 失败: {reason} | n={kw.get('n')} delta_s={kw.get('delta_s')} "
-                        f"v={v:.2f} half_w={kw.get('half_width', 0):.2f} "
-                        f"half_L={kw.get('half_length', 0):.2f} max_κ={kw.get('max_kappa', 0):.3f}"
+                        f"QP failed: {reason}"
                     )
-                    pb = kw.get("path_boundary")
-                    rpb = kw.get("raw_path_boundary")
-                    kr = kw.get("kappa_ref")
-                    if pb is not None and len(pb) > 0:
-                        self.get_logger().error(
-                            f"  path_bound[0]: l∈[{pb[0,0]:.3f},{pb[0,1]:.3f}] "
-                            f"raw[0]: l∈[{rpb[0,0]:.3f},{rpb[0,1]:.3f}] κ_ref[0]={kr[0]:.4f}"
-                        )
                     lv, uv = kw.get("l_vec"), kw.get("u_vec")
                     if lv is not None and uv is not None:
                         bad = np.where(lv > uv)[0]
@@ -1612,72 +1962,49 @@ class VehiclePerception(Node):
                 }
 
             # 可视化：发布 Frenet s-l Path
-            # if self.qp_frenet_path_pub is not None:
-            #     path_msg = Path()
-            #     path_msg.header.frame_id = "map"
-            #     path_msg.header.stamp = self.get_clock().now().to_msg()
-            #     for si, li in zip(s_qp, l_sol):
-            #         ps = PoseStamped()
-            #         ps.header = path_msg.header
-            #         ps.pose.position.x = float(si)
-            #         ps.pose.position.y = float(li)
-            #         ps.pose.position.z = 0.0
-            #         ps.pose.orientation.w = 1.0
-            #         path_msg.poses.append(ps)
-            #     self.qp_frenet_path_pub.publish(path_msg)
+            # NOTE: 如果无需在plotter中显示求解路径，可以注释以下代码并允许 _check_path_reusable 复用
+            if self.qp_frenet_path_pub is not None:
+                path_msg = Path()
+                path_msg.header.frame_id = "map"
+                path_msg.header.stamp = self.get_clock().now().to_msg()
+                for si, li in zip(s_qp, l_sol):
+                    ps = PoseStamped()
+                    ps.header = path_msg.header
+                    ps.pose.position.x = float(si)
+                    ps.pose.position.y = float(li)
+                    ps.pose.position.z = 0.0
+                    ps.pose.orientation.w = 1.0
+                    path_msg.poses.append(ps)
+                self.qp_frenet_path_pub.publish(path_msg)
 
-            # 将 Frenet (s,l) 转换为 XY，发布到 qp_xy_path 供控制器 Stanley 跟踪
-            if self.qp_xy_path_pub is None or can_reuse_qp:
+            stamp = self.get_clock().now().to_msg()
+            xy_raw = self._qp_frenet_to_xy_list(
+                s_qp,
+                l_sol,
+                np.asarray(accumulated_s, dtype=float),
+                np.asarray(reference_path_segment, dtype=float),
+            )
+
+            if not xy_raw:
                 return
-            # 计算 s→XY：在 reference_path_segment 上按 accumulated_s 插值
-            xy_points: list[tuple[float, float]] = []
-            acc_s = np.asarray(accumulated_s, dtype=float)
-            pts = np.asarray(reference_path_segment, dtype=float)
-            for si, li in zip(s_qp, l_sol):
-                # 找到 si 所在的参考线段
-                if si <= acc_s[0]:
-                    idx = 0
-                    t = 0.0
-                elif si >= acc_s[-1]:
-                    idx = len(acc_s) - 2
-                    t = 1.0
-                else:
-                    idx = np.searchsorted(acc_s, si) - 1
-                    idx = max(0, min(idx, len(acc_s) - 2))
-                    ds = acc_s[idx + 1] - acc_s[idx]
-                    t = 0.0 if abs(ds) < 1e-6 else float((si - acc_s[idx]) / ds)
-                p0 = pts[idx]
-                p1 = pts[idx + 1]
-                seg = p1 - p0
-                seg_len = np.linalg.norm(seg)
-                if seg_len < 1e-6:
-                    base_xy = p0
-                    theta = 0.0
-                else:
-                    base_xy = p0 + t * seg
-                    theta = math.atan2(seg[1], seg[0])
-                # 左侧为正：法向量
-                nx = -math.sin(theta)
-                ny = math.cos(theta)
-                x = float(base_xy[0] + li * nx)
-                y = float(base_xy[1] + li * ny)
-                xy_points.append((x, y))
-
-            if not xy_points:
-                return
-
-            path_msg = Path()
-            path_msg.header.frame_id = "map"
-            path_msg.header.stamp = self.get_clock().now().to_msg()
-            for x, y in xy_points:
-                ps = PoseStamped()
-                ps.header = path_msg.header
-                ps.pose.position.x = float(x)
-                ps.pose.position.y = float(y)
-                ps.pose.position.z = 0.0
-                ps.pose.orientation.w = 1.0
-                path_msg.poses.append(ps)
-            self.qp_xy_path_pub.publish(path_msg)
+            if self.local_planning_path_pub is not None:
+                xy_trunc = self._truncate_polyline_at_ego(xy_raw)
+                ppts = self._xy_list_to_planning_path_points(xy_trunc)
+                if ppts:
+                    self._publish_local_planning_and_trajectory(ppts, stamp)
+            elif self.qp_xy_path_pub is not None:
+                path_msg = Path()
+                path_msg.header.frame_id = "map"
+                path_msg.header.stamp = stamp
+                for x, y in xy_raw:
+                    ps = PoseStamped()
+                    ps.header = path_msg.header
+                    ps.pose.position.x = float(x)
+                    ps.pose.position.y = float(y)
+                    ps.pose.position.z = 0.0
+                    ps.pose.orientation.w = 1.0
+                    path_msg.poses.append(ps)
+                self.qp_xy_path_pub.publish(path_msg)
 
         except Exception as e:
             self.get_logger().error(f"QP 路径规划或发布失败: {e}")
@@ -1706,6 +2033,122 @@ class VehiclePerception(Node):
         world_corners = (rot @ local_corners.T).T + center_xy
         return world_corners
 
+    def _xy_to_sl_ego_with_s_window(
+        self,
+        point_xy: np.ndarray,
+        reference_path_segment: np.ndarray,
+        accumulated_s: np.ndarray,
+        s_start: float,
+        s_end: float,
+    ) -> tuple[float, float] | None:
+        """
+        自车专用：在 [s_start, s_end] 与路径 s 域求交后的区间内，于折线段内垂足上
+        取欧氏距离最小的 (s, l)。无首末段外延；输出 s 硬限制在交区间内。
+        先用 accumulated_s 上 searchsorted 定段索引若无候选则回退扫描全段。
+        """
+        n = len(reference_path_segment)
+        if n < 2:
+            return None
+        if s_start > s_end:
+            s_start, s_end = s_end, s_start
+        acc = np.asarray(accumulated_s, dtype=float)
+        if len(acc) != n:
+            return None
+        path_min = float(acc[0])
+        path_max = float(acc[-1])
+        s_start = max(path_min, float(s_start))
+        s_end = min(path_max, float(s_end))
+        eps = 1e-6
+        if s_end - s_start < eps:
+            return None
+
+        j_lo = int(np.searchsorted(acc, s_start, side="right"))
+        i_start = max(0, min(n - 2, j_lo - 1))
+        j_hi = int(np.searchsorted(acc, s_end, side="right"))
+        i_end = max(0, min(n - 2, j_hi - 1))
+        if i_start > i_end:
+            i_start, i_end = 0, n - 2
+
+        xy = np.asarray(point_xy, dtype=float).reshape(2)
+        ref = np.asarray(reference_path_segment, dtype=float)
+
+        def _scan_range(ia: int, ib: int) -> tuple[float, float, float]:
+            best_dist = float("inf")
+            best_s = 0.0
+            best_l = 0.0
+            ia = max(0, min(ia, n - 2))
+            ib = max(0, min(ib, n - 2))
+            if ia > ib:
+                return (best_s, best_l, best_dist)
+            for i in range(ia, ib + 1):
+                p0 = ref[i]
+                p1 = ref[i + 1]
+                seg_vec = p1 - p0
+                seg_len = float(np.linalg.norm(seg_vec))
+                if seg_len < eps:
+                    continue
+                seg_unit = seg_vec / seg_len
+                v = xy - p0
+                proj_len = float(np.clip(np.dot(v, seg_unit), 0.0, seg_len))
+                proj_point = p0 + proj_len * seg_unit
+                s_val = float(acc[i] + proj_len)
+                if s_val < s_start - eps or s_val > s_end + eps:
+                    continue
+                dist = float(np.linalg.norm(xy - proj_point))
+                if dist < best_dist:
+                    best_dist = dist
+                    rel = xy - proj_point
+                    cross = float(seg_vec[0] * rel[1] - seg_vec[1] * rel[0])
+                    lateral = float(np.linalg.norm(rel))
+                    d_val = float(np.sign(cross) * lateral) if lateral > eps else 0.0
+                    best_s = s_val
+                    best_l = d_val
+            return (best_s, best_l, best_dist)
+
+        bs, bl, bd = _scan_range(i_start, i_end)
+        if math.isinf(bd):
+            bs, bl, bd = _scan_range(0, n - 2)
+        if math.isinf(bd):
+            return None
+        return (float(bs), float(bl))
+
+    def _xy_to_sl_ego(
+        self,
+        point_xy: np.ndarray,
+        reference_path_segment: np.ndarray,
+        accumulated_s: np.ndarray,
+        mode: str = "global",
+        warm_start_s: float | None = None,
+        s_window: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
+        """自车 XY→SL，语义同 _xy_to_sl，但使用 _xy_to_sl_ego_with_s_window（无 math_utils 外延）。"""
+        n = len(reference_path_segment)
+        if n < 2:
+            return None
+        path_min = float(accumulated_s[0])
+        path_max = float(accumulated_s[-1])
+        if mode == "global":
+            return self._xy_to_sl_ego_with_s_window(
+                point_xy, reference_path_segment, accumulated_s, path_min, path_max
+            )
+        if mode == "window" and s_window is not None:
+            s0, s1 = s_window
+            return self._xy_to_sl_ego_with_s_window(
+                point_xy, reference_path_segment, accumulated_s, float(s0), float(s1)
+            )
+        if mode == "warm" and warm_start_s is not None:
+            window_half = 20.0
+            return self._xy_to_sl_ego_with_s_window(
+                point_xy,
+                reference_path_segment,
+                accumulated_s,
+                float(warm_start_s) - window_half,
+                float(warm_start_s) + window_half,
+            )
+        return self._xy_to_sl_ego_with_s_window(
+            point_xy, reference_path_segment, accumulated_s, path_min, path_max
+        )
+
     def _xy_to_sl_with_s_window(self,
                                 point_xy: np.ndarray,
                                 reference_path_segment: np.ndarray,
@@ -1713,75 +2156,24 @@ class VehiclePerception(Node):
                                 s_start: float,
                                 s_end: float) -> tuple[float, float] | None:
         """
-        在 [s_start, s_end] 区间内搜索参考线的最近投影点，返回 (s, d)。
+        障碍物等：将点投影到参考折线 (s, l)。走 math_utils.project_xy_to_sl_polyline
+        （窗口定位 + 可选外延 + 软缓冲）。
         """
-        n = len(reference_path_segment)
-        if n < 2:
+        if math_utils is None:
             return None
-
-        # 规范化s窗口
         if s_start > s_end:
             s_start, s_end = s_end, s_start
-
-        # 与路径区间求交集
-        path_min = float(accumulated_s[0])
-        path_max = float(accumulated_s[-1])
-        s_start = max(path_min, s_start)
-        s_end = min(path_max, s_end)
-        if s_end - s_start < 1e-6:
+        acc = np.asarray(accumulated_s, dtype=float)
+        if len(acc) < 2:
             return None
-
-        # 在 accumulated_s 上找到覆盖 [s_start, s_end] 的段索引范围
-        # 先用 s/point_spacing 估算索引，再做小范围修正，避免全局线性扫描
-        spacing = self.point_spacing if self.point_spacing > 1e-6 else 1.0
-        # 估算起止索引（四舍五入），注意要减去 path_min
-        i_start_est = int(round((s_start - path_min) / spacing))
-        i_end_est = int(round((s_end - path_min) / spacing))
-
-        # 初步裁剪到合法范围 [0, n-2]
-        i_start = max(0, min(i_start_est, n - 2))
-        i_end = max(0, min(i_end_est, n - 2))
-
-        if i_start > i_end or i_end < 0:
-            return None
-
-        best_dist = float('inf')
-        best_s = 0.0
-        best_d = 0.0
-
-        for i in range(i_start, i_end + 1):
-            p0 = reference_path_segment[i]
-            p1 = reference_path_segment[i + 1]
-            seg_vec = p1 - p0
-            seg_len = np.linalg.norm(seg_vec)
-            if seg_len < 1e-6:
-                continue
-            seg_unit = seg_vec / seg_len
-
-            v = point_xy - p0
-            proj_len = np.clip(np.dot(v, seg_unit), 0.0, seg_len)
-            proj_point = p0 + proj_len * seg_unit
-
-            # 只接受s落在[s_start,s_end]窗口内的候选
-            s_val = float(accumulated_s[i] + proj_len)
-            if s_val < s_start - 1e-6 or s_val > s_end + 1e-6:
-                continue
-
-            dist = float(np.linalg.norm(point_xy - proj_point))
-            if dist < best_dist:
-                best_dist = dist
-
-                rel = point_xy - proj_point
-                cross = seg_vec[0] * rel[1] - seg_vec[1] * rel[0]
-                d_val = np.sign(cross) * np.linalg.norm(rel)
-
-                best_s = s_val
-                best_d = float(d_val)
-
-        if best_dist is float('inf'):
-            return None
-
-        return best_s, best_d
+        return math_utils.project_xy_to_sl_polyline(
+            np.asarray(point_xy, dtype=float),
+            np.asarray(reference_path_segment, dtype=float),
+            acc,
+            float(s_start),
+            float(s_end),
+            eps=1e-6,
+        )
 
     def _xy_to_sl(self,
                   point_xy: np.ndarray,
@@ -1791,7 +2183,8 @@ class VehiclePerception(Node):
                   warm_start_s: float | None = None,
                   s_window: tuple[float, float] | None = None) -> tuple[float, float] | None:
         """
-        统一的 XYToSL 接口
+        障碍物 SL 边界等使用的 XY→SL（math_utils.project_xy_to_sl_polyline）。
+        自车请用 _xy_to_sl_ego。
           - mode='global' : 在整条参考线上搜索最近点
           - mode='warm'   : 使用 warm_start_s 附近的局部窗口搜索（当前未大规模使用）
           - mode='window' : 只在给定 [s_start, s_end] 窗口内搜索
@@ -1804,7 +2197,7 @@ class VehiclePerception(Node):
         path_max = float(accumulated_s[-1])
 
         if mode == "global":
-            # 在整段局部参考线上搜索最近点（s 范围为 [path_min, path_max]，例如 [-BACKWARD_DISTANCE, REFERENCE_LINE_HORIZON]）
+            # 在整段局部参考线上搜索最近点
             return self._xy_to_sl_with_s_window(
                 point_xy,
                 reference_path_segment,
@@ -1897,7 +2290,7 @@ class VehiclePerception(Node):
         sl_points_s.append(s0)
         sl_points_l.append(l0)
 
-        # 3. 后续角点：使用 hueristic s 窗口 [s_prev - 2*dist, s_prev + 2*dist]
+        # 3. 后续角点：使用 hueristic s 窗口
         prev_s = s0
         for i in range(1, num_corners):
             p = obs_corners[i]

@@ -18,6 +18,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped, Pose, Twist, Point
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import String
@@ -26,11 +27,11 @@ from rcl_interfaces.msg import Log as RosLog
 import lanelet2
 from lanelet2.projection import UtmProjector
 import math
-import time
 import heapq
 from collections import defaultdict
 import os
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
+from tf_transformations import euler_from_quaternion
 import numpy as np
 
 class MapControlNode(Node):
@@ -40,8 +41,11 @@ class MapControlNode(Node):
     3. 用A*算法做全局规划，并根据lanlet_id拼接路径段
     """
     def __init__(self):
-        super().__init__('map_control_node')
-        
+        super().__init__(
+            'map_control_node',
+            parameter_overrides=[Parameter('use_sim_time', value=True)],
+        )
+
         # OSM文件路径 - 使用ROS包资源路径，如果包未安装则使用相对路径
         try:
             package_share_directory = get_package_share_directory('map_load')
@@ -250,10 +254,6 @@ class MapControlNode(Node):
             self.get_logger().error("❌ lanelet2库未加载，无法提取中心线")
             return
                 
-        # FIXME: 直接将整条路径拼接成一个centerline去采样，不要一个个lanelet处理，否则可能导致路径间有间断
-        # TODO: 先粗略的采样再线性插值到0.25m，否则路径会过拟合
-        # TODO: plan_speed用简易的，当前曲率用前轮转角得到
-        # TODO: 两个断开的点之间三次多项式插值
         for lanelet_ in self.lanelet_map.laneletLayer:
             # 只处理道路类型的 lanelet，排除标线、人行道等
             if "subtype" not in lanelet_.attributes.keys() or lanelet_.attributes["subtype"] == "road":
@@ -610,7 +610,7 @@ class MapControlNode(Node):
                 break
         
         if lanelet_ is None:
-            # self.get_logger().warn(f"未找到lanelet_id={lanelet_id}")
+            self.get_logger().warn(f"未找到lanelet_id={lanelet_id}")
             return []
         
         left_bound = [lanelet2.geometry.to2D(p) for p in lanelet_.leftBound]
@@ -914,6 +914,10 @@ class MapControlNode(Node):
             
         start_pose = self.current_pose.position
         goal_pose = self.goal_pose.pose.position
+        orientation_q = self.current_pose.orientation
+        _, _, start_yaw = euler_from_quaternion(
+            [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        )
         
         self.waypoints = []
         self.current_waypoint_index = 0
@@ -965,8 +969,6 @@ class MapControlNode(Node):
         self.get_logger().info(f"找到Lanelet路径: {lanelet_path}")
         
         self.waypoints = []
-        self.waypoints.append((start_pose.x, start_pose.y))
-        
         # 按需从lanelet的leftBound/rightBound重新计算中心线
         for i, lanelet_id in enumerate(lanelet_path):
             # 重新计算完整中心线
@@ -984,6 +986,16 @@ class MapControlNode(Node):
                 start_idx = self._find_nearest_point_index_in_centerline(
                     start_pose.x, start_pose.y, centerline
                 )
+
+                vec1 = np.array(centerline[start_idx], dtype=np.float64) - np.array(
+                    [start_pose.x, start_pose.y], dtype=np.float64
+                )
+                vec2 = np.array(
+                    [math.cos(start_yaw), math.sin(start_yaw)], dtype=np.float64
+                )
+                if np.dot(vec1, vec2) > 0:
+                    self.waypoints.append((start_pose.x, start_pose.y))
+
                 for point in centerline[start_idx:]:
                     self.waypoints.append(point)
             elif i == len(lanelet_path) - 1:
@@ -1008,7 +1020,6 @@ class MapControlNode(Node):
     def plan_path_in_lanelet(self, lanelet_id, start_pose, goal_pose):
         """在同一lanelet内沿中心线规划路径"""
         self.waypoints = []
-        self.waypoints.append((start_pose.x, start_pose.y))
         
         # 按需从lanelet的leftBound/rightBound重新计算中心线
         centerline = self._compute_centerline_from_lanelet(lanelet_id)
@@ -1020,6 +1031,19 @@ class MapControlNode(Node):
             goal_idx = self._find_nearest_point_index_in_centerline(
                 goal_pose.x, goal_pose.y, centerline
             )
+
+            orientation_q = self.current_pose.orientation
+            _, _, start_yaw = euler_from_quaternion(
+                [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+            )
+            vec1 = np.array(centerline[start_idx], dtype=np.float64) - np.array(
+                [start_pose.x, start_pose.y], dtype=np.float64
+            )
+            vec2 = np.array(
+                [math.cos(start_yaw), math.sin(start_yaw)], dtype=np.float64
+            )
+            if np.dot(vec1, vec2) > 0:
+                self.waypoints.append((start_pose.x, start_pose.y))
             
             # 确保索引顺序正确
             if start_idx <= goal_idx:

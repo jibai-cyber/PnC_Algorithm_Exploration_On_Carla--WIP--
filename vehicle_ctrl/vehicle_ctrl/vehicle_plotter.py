@@ -10,23 +10,24 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.timer import Timer
 from std_msgs.msg import Float64MultiArray
 from nav_msgs.msg import Path
 try:
-    from map_load.msg import FrenetPath, SLBoundary, SLBoundaryArray, PathBoundary
+    from map_load.msg import FrenetPath, SLBoundary, SLBoundaryArray, PathBoundary, STGraph
 except ImportError:
     FrenetPath = None
     SLBoundary = None
     SLBoundaryArray = None
     PathBoundary = None
+    STGraph = None
 import matplotlib
 matplotlib.use('TkAgg')  # 使用TkAgg后端，支持交互式显示
 import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 import threading
-import time
 
 # 颜色定义
 RED = "\033[31m"
@@ -41,7 +42,10 @@ class VehiclePlotter(Node):
     """车辆控制绘图节点"""
 
     def __init__(self):
-        super().__init__('vehicle_plotter')
+        super().__init__(
+            'vehicle_plotter',
+            parameter_overrides=[Parameter('use_sim_time', value=True)],
+        )
 
         # 绘图配置
         self.enable_plotting = True
@@ -77,8 +81,8 @@ class VehiclePlotter(Node):
         # 绘图变量
         self.fig = None
         self.ax1 = None  # s-d 关系图
-        self.ax2 = None  # 航向误差
-        self.ax3 = None  # 归一化转向角
+        self.ax2 = None  # 航向误差、横向误差、归一化转向角（同图）
+        self.ax3 = None  # ST 图（t–s）
         self.ax4 = None  # 速度和加速度
         self.ax4_accel = None
         self.ax5 = None  # 油门和刹车
@@ -147,6 +151,17 @@ class VehiclePlotter(Node):
             self.qp_frenet_path_callback,
             10
         )
+
+        self.current_st_graph = None
+        if STGraph is not None:
+            self.st_graph_sub = self.create_subscription(
+                STGraph,
+                '/planning/st_graph',
+                self.st_graph_callback,
+                10,
+            )
+        else:
+            self.st_graph_sub = None
 
         # 初始化绘图
         if self.enable_plotting:
@@ -261,6 +276,29 @@ class VehiclePlotter(Node):
         except Exception as e:
             self.get_logger().warn(f"处理 PathBoundary 失败: {e}")
 
+    def st_graph_callback(self, msg):
+        """ST 图（障碍在 t-s 平面的轴对齐矩形）"""
+        if not self.enable_plotting:
+            return
+        try:
+            with self.data_lock:
+                self.current_st_graph = {
+                    't_horizon': float(msg.t_horizon),
+                    'regions': [
+                        {
+                            'id': r.obstacle_id,
+                            'static': bool(r.is_static),
+                            's_low': float(r.s_low),
+                            's_high': float(r.s_high),
+                            't_min': float(r.t_min),
+                            't_max': float(r.t_max),
+                        }
+                        for r in msg.regions
+                    ],
+                }
+        except Exception as e:
+            self.get_logger().warn(f"处理 STGraph 失败: {e}")
+
     def qp_frenet_path_callback(self, msg):
         """QP Frenet 路径回调：nav_msgs/Path 中 x=s, y=l"""
         if not self.enable_plotting:
@@ -285,7 +323,7 @@ class VehiclePlotter(Node):
             # 设置matplotlib使用非阻塞后端
             plt.ion()  # 开启交互模式
 
-            # 创建图形和子图（6个子图，2列3行布局：s-d关系、航向误差、转向角、速度、油门、误差）
+            # 创建图形和子图（6 子图 2×3：s-d、误差+转向、ST、速度、油门、误差）
             self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4), (self.ax5, self.ax6)) = plt.subplots(3, 2, figsize=(14, 10))
             self.fig.suptitle('Vehicle Control Error Real-time Monitoring', fontsize=14, fontweight='bold')
 
@@ -298,7 +336,7 @@ class VehiclePlotter(Node):
             self.line_qp_frenet, = self.ax1.plot([], [], 'g-', label='QP Frenet Path', linewidth=1.5, zorder=4)
             self.line_he, = self.ax2.plot([], [], 'g-', label='Heading Error', linewidth=1.5)
             self.line_cross_track_error, = self.ax2.plot([], [], 'r-', label='Cross Track Error', linewidth=1.5)
-            self.line_normalized_steer, = self.ax3.plot([], [], 'r-', label='Normalized Steer', linewidth=1.5)
+            self.line_normalized_steer, = self.ax2.plot([], [], 'b-', label='Normalized Steer', linewidth=1.5)
             self.line_speed, = self.ax4.plot([], [], 'm-', label='Vehicle Speed', linewidth=1.5)
             self.line_throttle, = self.ax5.plot([], [], 'c-', label='Throttle', linewidth=1.5)
             self.line_brake, = self.ax5.plot([], [], 'brown', label='Brake', linewidth=1.5)
@@ -315,21 +353,19 @@ class VehiclePlotter(Node):
             self.ax1.set_xlim([-30.0, 50.0])
             self.ax1.set_ylim([-8.0, 8.0])  # 固定纵轴范围：16m
 
-            # 设置子图2：航向误差和横向误差
+            # 设置子图2：航向误差、横向误差、归一化转向角
             self.ax2.set_xlabel('Time (s)', fontsize=10)
-            self.ax2.set_ylabel('Error Value', fontsize=10)
-            self.ax2.set_title('Heading Error & Cross Track Error', fontsize=12)
+            self.ax2.set_ylabel('Error / normalized steer', fontsize=10)
+            self.ax2.set_title('Heading / Cross-track / Normalized Steer', fontsize=12)
             self.ax2.grid(True, alpha=0.3)
             self.ax2.legend(loc='upper right')
             self.ax2.set_ylim([-1.0, 1.0])  # 初始范围，会自动调整
 
-            # 设置子图3：归一化转向角
-            self.ax3.set_xlabel('Time (s)', fontsize=10)
-            self.ax3.set_ylabel('Normalized Steer', fontsize=10)
-            self.ax3.set_title('Normalized Steer', fontsize=12)
+            # 子图3：ST 图（障碍在 t–s 平面），由 /planning/st_graph 更新
+            self.ax3.set_xlabel('t (s)', fontsize=10)
+            self.ax3.set_ylabel('s (m)', fontsize=10)
+            self.ax3.set_title('ST Graph (obstacles)', fontsize=12)
             self.ax3.grid(True, alpha=0.3)
-            self.ax3.legend(loc='upper right')
-            self.ax3.set_ylim([-1.0, 1.0])  # 初始范围，会自动调整（CARLA转向范围是[-1, 1]）
 
             # 设置子图4：车辆速度和加速度（双Y轴）
             self.ax4.set_xlabel('Time (s)', fontsize=10)
@@ -371,7 +407,7 @@ class VehiclePlotter(Node):
 
             plt.tight_layout()
             plt.show(block=False)
-            
+
             # 立即刷新一次，确保窗口显示
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
@@ -409,8 +445,11 @@ class VehiclePlotter(Node):
                 current_sl_boundaries = self.current_sl_boundaries.copy()
                 current_path_boundary = self.current_path_boundary.copy() if self.current_path_boundary else None
                 current_qp_frenet = self.current_qp_frenet_path.copy() if self.current_qp_frenet_path else None
+                current_st_graph = self.current_st_graph
 
             if len(time_data) == 0:
+                if STGraph is not None and current_st_graph is not None:
+                    self._redraw_st_graph(self.ax3, current_st_graph)
                 return
 
             # 更新s-l当前点（只显示当前坐标点，不显示历史轨迹）
@@ -460,30 +499,34 @@ class VehiclePlotter(Node):
                         self.ax1.add_patch(polygon)
                         self.obstacle_patches.append(polygon)
 
-            # 更新航向误差和横向误差图
+            # 更新航向误差、横向误差、归一化转向角（同一张时间序列图）
             self.line_he.set_data(time_data, he_data)
             if len(cross_track_error_data) > 0:
                 self.line_cross_track_error.set_data(time_data, cross_track_error_data)
+            if len(steer_data) > 0:
+                self.line_normalized_steer.set_data(time_data, steer_data)
+            else:
+                self.line_normalized_steer.set_data([], [])
 
             # 自动调整坐标轴范围
             time_range = [max(0, time_data[-1] - 30), time_data[-1] + 1]  # 显示最近30秒
 
-            # 航向误差和横向误差的联合范围
-            if len(he_data) > 0 or len(cross_track_error_data) > 0:
-                all_errors = np.concatenate([he_data, cross_track_error_data]) if len(he_data) > 0 and len(cross_track_error_data) > 0 else (he_data if len(he_data) > 0 else cross_track_error_data)
-                error_range = [np.min(all_errors) - 0.2, np.max(all_errors) + 0.2]
-                self.ax2.set_xlim(time_range)
-                self.ax2.set_ylim(error_range)
-
-            # 归一化转向角范围
+            # ax2：航向误差、横向误差、转向角的联合纵轴范围
+            series_list = []
+            if len(he_data) > 0:
+                series_list.append(np.asarray(he_data, dtype=float))
+            if len(cross_track_error_data) > 0:
+                series_list.append(np.asarray(cross_track_error_data, dtype=float))
             if len(steer_data) > 0:
-                steer_range = [np.min(steer_data) - 0.1, np.max(steer_data) + 0.1]
-                # 限制在[-1, 1]范围内
-                steer_range = [max(-1.0, steer_range[0]), min(1.0, steer_range[1])]
-                self.ax3.set_xlim(time_range)
-                self.ax3.set_ylim(steer_range)
-                # 更新归一化转向角图
-                self.line_normalized_steer.set_data(time_data, steer_data)
+                series_list.append(np.asarray(steer_data, dtype=float))
+            if series_list:
+                all_ax2 = np.concatenate(series_list)
+                y_min = float(np.min(all_ax2)) - 0.2
+                y_max = float(np.max(all_ax2)) + 0.2
+                if y_max - y_min < 0.05:
+                    y_min, y_max = y_min - 0.5, y_max + 0.5
+                self.ax2.set_xlim(time_range)
+                self.ax2.set_ylim([y_min, y_max])
 
             # 速度和加速度范围（双Y轴）
             if len(speed_data) > 0:
@@ -523,12 +566,48 @@ class VehiclePlotter(Node):
                 self.line_speed_error.set_data(time_data, speed_error_data)
                 self.line_accel_error.set_data(time_data, accel_error_data)
 
+            # ST 图（t–s，障碍矩形），置于 ax3
+            if STGraph is not None and current_st_graph is not None:
+                self._redraw_st_graph(self.ax3, current_st_graph)
+
             # 刷新图形
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
 
         except Exception as e:
             self.get_logger().warn(f"更新绘图失败: {e}")
+
+    def _redraw_st_graph(self, ax, st_data: dict) -> None:
+        from matplotlib.patches import Rectangle
+
+        ax.clear()
+        ax.set_xlabel('t (s)', fontsize=10)
+        ax.set_ylabel('s (m)', fontsize=10)
+        ax.set_title('ST obstacles (blue=static, orange=dynamic)', fontsize=11)
+        ax.grid(True, alpha=0.3)
+        th = float(st_data.get('t_horizon', 5.0))
+        smax = 10.0
+        smin_ax = 0.0
+        for r in st_data.get('regions', []):
+            smax = max(smax, r['s_high'] + 2.0, abs(r['s_low']) + 2.0)
+            smin_ax = min(smin_ax, r['s_low'] - 1.0)
+            w = max(r['t_max'] - r['t_min'], 1e-6)
+            h = max(r['s_high'] - r['s_low'], 1e-6)
+            fc = (0.2, 0.45, 0.95, 0.35) if r['static'] else (0.95, 0.55, 0.15, 0.35)
+            ec = 'navy' if r['static'] else 'darkorange'
+            ax.add_patch(
+                Rectangle(
+                    (r['t_min'], r['s_low']),
+                    w,
+                    h,
+                    facecolor=fc,
+                    edgecolor=ec,
+                    linewidth=1.2,
+                )
+            )
+        ax.set_xlim(0, max(th, 0.5))
+        ax.set_ylim(smin_ax, max(smax, 5.0))
+        ax.axhline(0, color='k', linewidth=0.6, linestyle='--', alpha=0.6)
 
 
 def main(args=None):
@@ -543,7 +622,7 @@ def main(args=None):
             if plotter.enable_plotting and plotter.fig is not None:
                 try:
                     plotter.fig.canvas.flush_events()  # 处理GUI事件
-                except:
+                except Exception:
                     pass
     except KeyboardInterrupt:
         plotter.get_logger().info("正在关闭绘图节点...")

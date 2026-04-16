@@ -460,7 +460,7 @@ class FrenetQPPlanner:
 
         if weights is None:
             weights = {}
-        w_ref = float(weights.get("w_ref", 1.0))
+        w_ref = float(weights.get("w_ref", 0.3))
         w_dl = float(weights.get("w_dl", 0.1))
         w_ddl = float(weights.get("w_ddl", 0.1))
         w_dddl = float(weights.get("w_dddl", 0.01))

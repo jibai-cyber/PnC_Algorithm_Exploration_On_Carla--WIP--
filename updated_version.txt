@@ -148,8 +148,11 @@ version 2.2
 
    - 仅由复用QP插值得到的(l_init, dl_init, ddl_init)估计值可能不准确（并非复用QP求得的原始点），
      所以可能复用QP可以得到的解，在新的QP求解中就因初始点约束太过严格（最初为等式约束）且速度、参考线曲率发生一定变化，
-     导致其与其它约束（比如角点约束、曲率约束）产生冲突，且贴近障碍物时求解空间减小（主要原因），有概率会求解失败
+     导致其与其它约束（比如角点约束、曲率约束）产生冲突，有概率会求解失败
+
+     主要原因是贴近障碍物时求解空间减小，因为纵向步长确定的情况下，横向步长会受曲率约束影响
      （失败大多存在于经过obs时，由osqp_status=7或2转为3）
+
      所以当前起始点约束采用的是软约束，允许极小范围的偏差调整，能极大降低求解失败概率（数十次测试下，由原本的10%到0%）。
 
    - 修正 PathBoundary 逻辑：@map_load/map_load/vehicle_perception.py:912-915，修正错画边界的逻辑
@@ -189,3 +192,110 @@ version 2.2.1
 TODO:
 1. 时空联合规划，完善借道决策相关逻辑
 2. 见 version 2.2
+
+
+---
+version 2.3
+1. following_scenario: 调用carla相关api，添加跟车场景，供动态避障算法调试
+2. 采用config中json文件方式配置控制相关参数，方便调试
+
+3. 修改carla-ros-bridge逻辑，补充显式RTF设置，便于调整 sim-time 和 wall-time 之间的比值
+   在两次tick中加入节流逻辑来实现RTF设置
+   （需要注意carla为service端，carla-ros-bridge和其他ROS节点属于一个client端。
+   client端设置同步模式时需要靠 world.tick() 推进仿真时间，且需确保只能有一个client可以主动tick，
+   其余client需要 world.wait_for_tick() 来保持同步（如scenario_set））
+
+   由gazebo的变量定义可推导得：
+   sim_time_elapse / wall_time_elapse = max_step_size * real_time_update_rate = real_time_factor(RTF)
+   详见 REAL_TIME_FACTOR_CHANGES.md
+
+   ROS相关节点也需要进行设置上的更改，确保订阅的是carla-ros-bridge发布的 '/clock' 话题，
+   self.get_clock().now() 才不会获取到默认订阅的ROS系统时间(wall-time)，保证时钟源统一：
+   super().__init__(
+      'ROS_NODE_NAME',
+      parameter_overrides=[Parameter('use_sim_time', value=True)],
+   )
+
+   需要承认的是，先前的版本一直没有发现这个问题的存在。因为 object.json 文件前几次设置了6个摄像头且分辨率和帧率较高，
+   且经过订阅 '/clock' 话题发现启动 Terminal 3(spawn objects) 后，受CPU算力影响，
+   其频率(real_time_update_rate)正好在20Hz左右，
+   又因为carla-ros-bridge默认设置的 fixed_delta_seconds(max_step_size)为0.05，
+   所以主观上难以察觉 “sim-time 和 wall-time不同步” 的问题，当然也是受限于先验知识的积累
+   希望对今后的学习有所警示，提升对潜在问题的洞察能力和基础知识的重视
+
+4. 时间对齐后 U-turn 处控制效果有明显提升
+5. 动静态障碍物区分处理，防止ST图频繁迭代SL图，导致避障路径求解难度和算力损耗增大
+
+6. 获取碰撞区域，投影到ST图（速度规划前置工作）
+   - ST图投影参考线为QP算出的局部路径，以ego位置为起点（需对复用的路径进行裁剪）
+
+   - Apollo的方案是在 Cartesian 坐标系靠两层循环分别迭代obs和ego的轨迹，判断两者box是否有碰撞
+     外层迭代obs轨迹的trajectory_step，内层迭代ego的s，得到粗解后二分得到首次碰撞和最后一次碰撞的s
+
+     我选择只遍历obs的Trajectory，把该Trajectory的每一个dt在Cartesian坐标系下先转换获得其box，
+     然后投影到新参考线的frenet坐标系上；ego的轨迹投影到新参考线frenet坐标系上就是两条平行于s轴的线段，
+     两者的l分别为正负adc_buffer，长度定义为上述Trajectory的s长度加上ego的半个车长（考虑ego的box）
+     而这两条平行的线段和adc_buffer正好组成一个新矩形的长和宽
+
+     问题就转换为用这个新矩形去裁剪obs投影形成的多边形，求裁剪后多边形的min_s和max_s（肯定处于端点处）
+     对于该典型问题，我采用的是Sutherland–Hodgman算法（计算机图形学）
+
+     其实最开始是打算用扫描线算法求解obs多边形内部平行于S轴的最长线段并将其视为结果，
+     分析后发现其仅使用于部分场景（如obs垂直于参考线切入或只有一个角点位于新矩形内），结果极具局限性。
+     我们常希望能尽快用已知的知识体系去转化和解决问题，但遇到素为谋面的问题时，这往往是最大的局限所在
+
+   - 定义新消息类型，见map_load/msg。将 Path 和 SpeedProfile 对齐得到 Trajectory， 
+     Trajectory 替代原本的 Path 发布至控制器。便于后续路径和速度的解偶规划
+
+   - 新参考线路径可能存在较大曲率；obs四个角点各自投到参考线得到相应坐标后，
+     在 s–l 平面用直线连接四点可能不等价于 box 在真实空间占用的区域，边可能顺序错乱或得到凹多边形。
+     采用Apollo “边中点 + 补点” 的流程（ReferenceLine::GetSLBoundary）增强其泛化能力
+
+7. 初步拟定ego对obs的决策（后续完善）：
+
+   -动态obs
+   ├── overtake
+   ├── yield
+   └── follow
+
+   -静态obs
+   ├── nudge
+   └── stop
+
+   本质上是对应第5点，具体实现说明待后续速度规划完善后补充
+
+
+8. 修复ego在静态obs后方启动异常的bug
+
+9. map_control.py: 解决起始部分路径可能会出现往ego后方“折返”的bug
+
+10. 在静态obs后划 stop_line 供速度规划，这样就不必在 speed_planner 中针对
+    不同决策的静态obs进行区分，且每次遇到静态obs，可以先停在 stop_line，判断其
+    决策是否为nudge且可以borrow，随后规划借道凸空间和轨迹
+
+    此外，还可以从 stop_line 处截断PathBoudary，防止QP在ADC拓展后无可行PathBoudary时
+    仍进行无意义计算，且导致求解失败（因为当前遇到静态obs应该依据其决策判断是否避让，而非
+    一旦遇到就borrow对向车道，拓展凸空间进行避障规划，所以说在 stop_line 之后的路径，
+    当ego还未停在 stop_line 之前是无意义的规划）
+    
+11. 改进 XYToSL 投影方式，节省算力，弥补路径范围外/边界处无法正常投影的bug
+
+12. 优化 PathBoudary 借道区间合并的相应逻辑，使其与 stop_line 兼容
+
+13. 上传当前工程效果，后续有进展时进行维护
+
+TODO:
+1. Terminal 9改为节点启动且拓展多场景，路径配置写进节点启动参数中
+2. 完善速度规划后，结合障碍物动静态和ST图决定是否主动迭代SL图
+3. 添加速度规划的非线性曲率约束(optional)
+4. 对于静态障碍物的边界可以采用扫描线算法，结合决策求出边，增强泛化能力(optional)
+5. 完成对obs的轨迹预测，实现完整速度规划
+6. 当前感知部分和路径规划部分都写在了一个节点map_load/vehicle_perception.py，后期需要拆解成两个独立节点
+7. 发现部分lanelet中心线的点会丢失，少部分终点可能会规划到下一个lanelet的起点附近（rviz中显示的路径越过goal_pose箭头）
+   当前仍能停在终点是因为强行插入了goal_pose
+   起点在丢失的lanelet上导致的路径丢失问题已通过插值和点乘判断解决。此问题需要尽快协调负责画osm地图的同学解决
+8. 决策部分实现预计放入 version 3.0
+9. 借道避障碍时 PathBoudary 上界过渡不够平滑，当前过渡形状为“阶梯”形，后续必须改为“斜坡”型。
+   否则容易导致QP求解失败，除非降低 cost function 中“逼近凸空间中心线”项的权重 (w_ref)
+10. 当有 RIGHT_NUDGE 类型的obs出现在借道所拓展的 PathBoudary 纵向区间中，虽然可以正确画出上界
+    但是和第9点问题类似，不够平滑，后续考虑采用一些平滑处理求出的 PathBoudary 上下界

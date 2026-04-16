@@ -14,3 +14,5 @@ float64[] boundary_l   # 边界点l坐标数组
 
 # 车辆ID
 string vehicle_id
+
+uint8 decision

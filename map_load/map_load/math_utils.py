@@ -400,3 +400,175 @@ def find_projection_point_on_path(
         best_proj_s = accumulated_s[nearest_idx] if nearest_idx < len(accumulated_s) else 0.0
     
     return best_seg_idx, best_proj_point, best_proj_s
+
+
+def project_xy_to_sl_polyline(
+    xy: np.ndarray,
+    ref_xy: np.ndarray,
+    acc_s: np.ndarray,
+    s_window_lo: Optional[float] = None,
+    s_window_hi: Optional[float] = None,
+    eps: float = 1e-6,
+    s_soft_buffer: float = 50.0,
+) -> Optional[Tuple[float, float]]:
+    """
+    将平面点投影到折线的 (s, l)。
+
+    - s_window_lo / s_window_hi 均为 None：全局模式，整条折线参与搜索，首/末外延用路径物理首尾边。
+    - 否则为窗口模式：用 s 在 acc_s 上二分定位段索引 k_first、k_last，先首边外延、再末边外延、再在
+      [k_first, k_last] 段上找 |l| 最小垂足；不做全路径回退。投影得到 (s,l) 后做软约束：
+      s ∈ [s_lo - s_soft_buffer, s_hi + s_soft_buffer]（s_lo/s_hi 为窗口与路径域求交后的边界）。
+    """
+    n = len(ref_xy)
+    if n < 2:
+        return None
+    acc = np.asarray(acc_s, dtype=float)
+    if len(acc) != n:
+        return None
+
+    path_min = float(acc[0])
+    path_max = float(acc[-1])
+    use_window = s_window_lo is not None and s_window_hi is not None
+
+    if not use_window:
+        s_lo, s_hi = path_min, path_max
+    else:
+        sw0, sw1 = float(s_window_lo), float(s_window_hi)
+        if sw0 > sw1:
+            sw0, sw1 = sw1, sw0
+        if sw0 > path_max + eps or sw1 < path_min - eps:    # 窗口与路径域无交集，直接全局搜索
+            use_window = False
+            s_lo, s_hi = path_min, path_max
+        else:
+            s_lo = max(path_min, sw0)
+            s_hi = min(path_max, sw1)
+    if s_hi - s_lo < eps:
+        return None
+
+    xy = np.asarray(xy, dtype=float).reshape(2)
+
+    def _soft_ok(s_val: float) -> bool:
+        if not use_window:
+            return True
+        return s_val >= s_lo - s_soft_buffer - eps and s_val <= s_hi + s_soft_buffer + eps
+
+    if not use_window:
+        # --- 全局：首段前外延（物理首边）---
+        p0_head = ref_xy[0]
+        p1_head = ref_xy[1]
+        seg_head = p1_head - p0_head
+        slen_head = float(np.linalg.norm(seg_head))
+        if slen_head >= eps:
+            u_head = seg_head / slen_head
+            rel_head = xy - p0_head
+            t_head = float(np.dot(rel_head, u_head))
+            if t_head < -eps:
+                s_ext = float(acc[0] + t_head)
+                l_ext = float(u_head[0] * rel_head[1] - u_head[1] * rel_head[0])
+                return (s_ext, l_ext)
+
+        # --- 全局：末段后外延 ---
+        p0_tail = ref_xy[n - 2]
+        p1_tail = ref_xy[n - 1]
+        seg_tail = p1_tail - p0_tail
+        slen_tail = float(np.linalg.norm(seg_tail))
+        if slen_tail >= eps:
+            u_tail = seg_tail / slen_tail
+            rel_from_p0_tail = xy - p0_tail
+            t_tail = float(np.dot(rel_from_p0_tail, u_tail))
+            if t_tail > slen_tail + eps:
+                rel2 = xy - p1_tail
+                s_ext = float(acc[n - 1] + np.dot(rel2, u_tail))
+                l_ext = float(u_tail[0] * rel2[1] - u_tail[1] * rel2[0])
+                return (s_ext, l_ext)
+
+        # --- 全局：段内，且 s 落在 [path_min, path_max]（与旧行为一致）---
+        best_interior: Optional[Tuple[float, float]] = None
+        best_abs_l = float("inf")
+        for i in range(n - 1):
+            p0 = ref_xy[i]
+            p1 = ref_xy[i + 1]
+            seg = p1 - p0
+            slen = float(np.linalg.norm(seg))
+            if slen < eps:
+                continue
+            u = seg / slen
+            rel = xy - p0
+            t = float(np.dot(rel, u))
+            if t < -eps or t > slen + eps:
+                continue
+            s_val = float(acc[i] + t)
+            if s_val < s_lo - eps or s_val > s_hi + eps:
+                continue
+            l_signed = float(u[0] * rel[1] - u[1] * rel[0])
+            al = abs(l_signed)
+            if best_interior is None or al < best_abs_l - eps:
+                best_interior = (s_val, l_signed)
+                best_abs_l = al
+
+        if best_interior is not None:
+            return (best_interior[0], best_interior[1])
+        return None
+
+    # --- 窗口模式：二分定位 k_first、k_last ---
+    j_lo = int(np.searchsorted(acc, s_lo, side="right"))
+    k_first = max(0, min(n - 2, j_lo - 1))
+    j_hi = int(np.searchsorted(acc, s_hi, side="right"))
+    k_last = max(0, min(n - 2, j_hi - 1))
+
+    # 1) 窗口左边界所在边的前向外延
+    p0_h = ref_xy[k_first]
+    p1_h = ref_xy[k_first + 1]
+    seg_h = p1_h - p0_h
+    slen_h = float(np.linalg.norm(seg_h))
+    if slen_h >= eps:
+        u_h = seg_h / slen_h
+        rel_h = xy - p0_h
+        t_h = float(np.dot(rel_h, u_h))
+        if t_h < -eps:
+            s_ext = float(acc[k_first] + t_h)
+            l_ext = float(u_h[0] * rel_h[1] - u_h[1] * rel_h[0])
+            if _soft_ok(s_ext):
+                return (s_ext, l_ext)
+
+    # 2) 窗口右边界所在边的后向外延
+    p0_t = ref_xy[k_last]
+    p1_t = ref_xy[k_last + 1]
+    seg_t = p1_t - p0_t
+    slen_t = float(np.linalg.norm(seg_t))
+    if slen_t >= eps:
+        u_t = seg_t / slen_t
+        rel_t = xy - p0_t
+        t_t = float(np.dot(rel_t, u_t))
+        if t_t > slen_t + eps:
+            rel2 = xy - p1_t
+            s_ext = float(acc[k_last + 1] + np.dot(rel2, u_t))
+            l_ext = float(u_t[0] * rel2[1] - u_t[1] * rel2[0])
+            if _soft_ok(s_ext):
+                return (s_ext, l_ext)
+
+    # 3) 窗口内段上垂足，不按 s_lo/s_hi 硬滤
+    best_interior_w: Optional[Tuple[float, float]] = None
+    best_abs_l_w = float("inf")
+    for i in range(k_first, k_last + 1):
+        p0 = ref_xy[i]
+        p1 = ref_xy[i + 1]
+        seg = p1 - p0
+        slen = float(np.linalg.norm(seg))
+        if slen < eps:
+            continue
+        u = seg / slen
+        rel = xy - p0
+        t = float(np.dot(rel, u))
+        if t < -eps or t > slen + eps:
+            continue
+        s_val = float(acc[i] + t)
+        l_signed = float(u[0] * rel[1] - u[1] * rel[0])
+        al = abs(l_signed)
+        if best_interior_w is None or al < best_abs_l_w - eps:
+            best_interior_w = (s_val, l_signed)
+            best_abs_l_w = al
+
+    if best_interior_w is not None and _soft_ok(best_interior_w[0]):
+        return (best_interior_w[0], best_interior_w[1])
+    return None

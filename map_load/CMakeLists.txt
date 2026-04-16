@@ -9,6 +9,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(derived_object_msgs REQUIRED)
 
 # Generate custom messages
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -16,7 +17,17 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SLBoundary.msg"
   "msg/SLBoundaryArray.msg"
   "msg/PathBoundary.msg"
-  DEPENDENCIES std_msgs
+  "msg/PlanningPathPoint.msg"
+  "msg/PlanningSpeedPoint.msg"
+  "msg/PlanningTrajectoryPoint.msg"
+  "msg/LocalPlanningPath.msg"
+  "msg/PlanningSpeedProfile.msg"
+  "msg/EgoPlanningTrajectory.msg"
+  "msg/STObstacleRegion.msg"
+  "msg/STGraph.msg"
+  "msg/PlanningObstacle.msg"
+  "msg/PlanningObstacleArray.msg"
+  DEPENDENCIES std_msgs derived_object_msgs
 )
 
 # Install Python modules to the same location as message bindings
@@ -77,6 +88,24 @@ file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vehicle_perception"
 install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/vehicle_perception"
   DESTINATION lib/${PROJECT_NAME}
 )
+
+# speed_planner
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/speed_planner"
+  CONTENT "#!/usr/bin/env python3\nimport sys\nfrom map_load.speed_planner import main\nif __name__ == '__main__':\n    sys.exit(main())\n"
+)
+install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/speed_planner"
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# file(GENERATE) creates files without the executable bit; --symlink-install then
+# points lib/pkg/exe -> build/.../exe, and ros2 run skips non-X_OK paths ("No executable found").
+add_custom_target(map_load_entrypoints_executable ALL
+  COMMAND chmod a+x
+          "${CMAKE_CURRENT_BINARY_DIR}/map_control_node"
+          "${CMAKE_CURRENT_BINARY_DIR}/path_smoother_node"
+          "${CMAKE_CURRENT_BINARY_DIR}/vehicle_perception"
+          "${CMAKE_CURRENT_BINARY_DIR}/speed_planner"
+  COMMENT "chmod +x map_load ros2 run entry points")
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

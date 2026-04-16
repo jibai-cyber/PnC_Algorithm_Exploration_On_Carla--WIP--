@@ -1,0 +1,41 @@
+{
+  "stanley": {
+    "k": 0.7,
+    "epsilon": 0.3,
+    "max_steer": 1.22,
+    "filter_alpha": 0.2,
+    "lookahead_base": 1.5,
+    "lookahead_gain": 0.5,
+    "curvature_feedforward_gain": 0.0
+  },
+  "speed_controller": {
+    "kp": 2.0,
+    "ki": 0.15,
+    "kd": 0.05,
+    "output_limits": [
+      -2.0,
+      2.0
+    ],
+    "integral_limit": 1.0
+  },
+  "throttle_controller": {
+    "kp": 0.3,
+    "ki": 0.15,
+    "kd": 0.0,
+    "output_limits": [
+      0.0,
+      1.0
+    ],
+    "integral_limit": 10.0
+  },
+  "brake_controller": {
+    "kp": 0.15,
+    "ki": 0.1,
+    "kd": 0.0,
+    "output_limits": [
+      0.0,
+      1.0
+    ],
+    "integral_limit": 5.0
+  }
+}

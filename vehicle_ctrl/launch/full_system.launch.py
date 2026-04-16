@@ -22,5 +22,11 @@ def generate_launch_description():
             name='vehicle_perception',
             output='screen',
         ),
+        Node(
+            package='map_load',
+            executable='speed_planner',
+            name='speed_planner',
+            output='screen',
+        ),
     ])
 

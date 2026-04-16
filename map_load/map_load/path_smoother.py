@@ -11,13 +11,13 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from std_msgs.msg import Int32, Header, Float64
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
 import numpy as np
 import scipy.sparse as sp
-import time
 import osqp
 from map_load import math_utils
 
@@ -26,8 +26,11 @@ class PathSmootherNode(Node):
     """路径平滑节点"""
     
     def __init__(self):
-        super().__init__('path_smoother_node')
-        
+        super().__init__(
+            'path_smoother_node',
+            parameter_overrides=[Parameter('use_sim_time', value=True)],
+        )
+
         # 平滑参数配置
         self.smooth_w1 = 0.3   # 相似权重：控制与原始路径的接近程度
         self.smooth_w2 = 1.0   # 平滑权重：控制曲率平滑度
@@ -54,7 +57,6 @@ class PathSmootherNode(Node):
         self.current_velocity = 0.0  # 当前速度 (m/s)
         self.last_nearest_idx = -1  # 上一次的nearest_idx，用于增量平滑
         self.last_smooth_end_idx = -1  # 上一次平滑的结束索引
-        self.last_smooth_time = 0.0
         self.waypoints_received = False
         self.nearest_idx_received = False
         self.velocity_received = False
@@ -192,7 +194,6 @@ class PathSmootherNode(Node):
             self.waypoints_received = False
             self.last_nearest_idx = -1
             self.last_smooth_end_idx = -1
-            self.last_smooth_time = 0.0
             self.current_nearest_idx = 0
             self.nearest_idx_received = False
             
@@ -607,9 +608,6 @@ class PathSmootherNode(Node):
         if len(self.current_waypoints) < 3:
             return
         
-        # 检查时间间隔（10Hz频率控制）
-        current_time = time.time()
-        
         # 获取局部路径段（支持增量平滑）
         local_segment, start_idx, end_idx, overlap_indices, new_region_indices, is_incremental, is_end_point = self.get_local_path_segment(
             self.current_waypoints, 
@@ -620,7 +618,6 @@ class PathSmootherNode(Node):
         
         if local_segment is None or len(local_segment) < 3:
             self.last_nearest_idx = self.current_nearest_idx
-            self.last_smooth_time = current_time
             return
         
         # 保存本次平滑的结束索引（用于下次增量平滑）
@@ -650,7 +647,6 @@ class PathSmootherNode(Node):
         
         # 更新状态
         self.last_nearest_idx = self.current_nearest_idx
-        self.last_smooth_time = current_time
     
     def publish_path_update(self, start_idx, smoothed_segment, overlap_indices, new_region_indices, is_incremental, is_end_point):
         """

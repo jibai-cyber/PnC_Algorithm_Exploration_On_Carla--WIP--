@@ -27,6 +27,7 @@ setup(
             'map_control_node = map_load.map_control:main',
             'path_smoother_node = map_load.path_smoother:main',
             'vehicle_perception = map_load.vehicle_perception:main',
+            'speed_planner = map_load.speed_planner:main',
         ],
     },
 )

@@ -1,10 +1,14 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import PoseStamped
 
 class GoalPoseRepublisher(Node):
     def __init__(self, role_name):
-        super().__init__('goal_pose_republisher')  # 修改1: 更清晰的节点名
+        super().__init__(
+            'goal_pose_republisher',
+            parameter_overrides=[Parameter('use_sim_time', value=True)],
+        )
         self.role_name = role_name
         
         # 修改2: 添加调试日志显示角色名

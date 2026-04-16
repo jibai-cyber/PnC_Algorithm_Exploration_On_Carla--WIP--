@@ -3,17 +3,21 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.timer import Timer
+from rclpy.time import Time
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float64MultiArray, Int32
-from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus, CarlaEgoVehicleInfo
+from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleInfo
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from tf_transformations import euler_from_quaternion
+import copy
+import json
 import math
+import os
 import numpy as np
-import time
 import threading
 import carla
 
@@ -28,52 +32,143 @@ from .bicycle_model_ekf import BicycleModelEKF
 from .constants import GREEN, CYAN, RESET
 
 
+def _default_carla_control_params():
+    return {
+        'stanley': {
+            'k': 6,
+            'epsilon': 0.3,
+            'max_steer': 1.22,
+            'filter_alpha': 0.2,
+            'lookahead_base': 1.5,
+            'lookahead_gain': 0.5,
+            'curvature_feedforward_gain': 0.0,
+        },
+        'speed_controller': {
+            'kp': 2.0,
+            'ki': 0.15,
+            'kd': 0.05,
+            'output_limits': (-2.0, 2.0),
+            'integral_limit': 1.0,
+        },
+        'throttle_controller': {
+            'kp': 0.15,
+            'ki': 0.04,
+            'kd': 0.0,
+            'output_limits': (0.0, 1.0),
+            'integral_limit': 10.0,
+        },
+        'brake_controller': {
+            'kp': 0.05,
+            'ki': 0.01,
+            'kd': 0.0,
+            'output_limits': (0.0, 1.0),
+            'integral_limit': 5.0,
+        },
+    }
+
+
+def _colcon_workspace_src_config_path():
+    try:
+        from ament_index_python.packages import get_package_prefix
+        prefix = get_package_prefix('vehicle_ctrl')
+        install_root = os.path.dirname(prefix)
+        ws = os.path.dirname(install_root)
+        return os.path.join(ws, 'src', 'vehicle_ctrl', 'config', 'carla_control_params.json')
+    except Exception:
+        return None
+
+
+def _load_carla_control_params(logger=None):
+    defaults = _default_carla_control_params()
+    paths = []
+    override = os.environ.get('VEHICLE_CTRL_CONTROL_PARAMS')
+    if override:
+        paths.append(os.path.expanduser(override.strip()))
+    module_dir = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    paths.append(
+        os.path.normpath(os.path.join(module_dir, '..', 'config', 'carla_control_params.json'))
+    )
+    ws_src = _colcon_workspace_src_config_path()
+    if ws_src:
+        paths.append(os.path.normpath(ws_src))
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory('vehicle_ctrl')
+        paths.append(os.path.join(share, 'config', 'carla_control_params.json'))
+    except Exception:
+        pass
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                raise ValueError('root must be a JSON object')
+            cfg = copy.deepcopy(defaults)
+            for key in cfg:
+                if key in raw and isinstance(raw[key], dict):
+                    cfg[key].update(raw[key])
+            if logger:
+                logger.info(f'Loaded vehicle control params from {path}')
+            return cfg
+        except Exception as e:
+            if logger:
+                logger.warning(f'Failed to load {path}: {e}')
+    if logger:
+        logger.warning('Using built-in default vehicle control params (no valid config file found)')
+    return copy.deepcopy(defaults)
+
+
+def _pid_from_section(section, dt):
+    lim = section['output_limits']
+    if isinstance(lim, (list, tuple)):
+        lim = (float(lim[0]), float(lim[1]))
+    il = section.get('integral_limit')
+    return {
+        'kp': float(section['kp']),
+        'ki': float(section['ki']),
+        'kd': float(section['kd']),
+        'dt': dt,
+        'output_limits': lim,
+        'integral_limit': None if il is None else float(il),
+    }
+
+
 class CarlaVehicleControl(Node):
     """车辆控制节点"""
     
     def __init__(self):
-        super().__init__('carla_vehicle_control')
-        
+        super().__init__(
+            'carla_vehicle_control',
+            parameter_overrides=[Parameter('use_sim_time', value=True)],
+        )
+
         # 控制参数
         self.control_dt = 0.05  # 20Hz
         self.max_speed = 6.0  # m/s (约21.6 km/h)
         self.min_speed = 0.5
         self.max_acceleration = 2.0
         self.max_deceleration = -3.0
-        
-        # 初始化Stanley控制器
-        # 这里的k参数过小会导致横向位置偏差对前轮转角的影响小，k参数过大会导致对横向误差较为敏感，容易发生震荡
+        self.dead_zone_throttle = 0.1
+
+        ctrl_cfg = _load_carla_control_params(self.get_logger())
+        st = ctrl_cfg['stanley']
+        # Stanley：k 过小则横向误差对转角影响小，过大则易震荡（参数见 config/carla_control_params.json）
         self.stanley = StanleyController(
-            k=6,
-            epsilon=0.3,
-            max_steer=1.22,
-            filter_alpha=0.2,
-            lookahead_base=1.5,
-            lookahead_gain=0.5
-        )
-        
-        # 初始化PID速度控制器
-        self.speed_controller = PIDController(
-            kp=2.0, ki=0.15, kd=0.05, 
-            dt=self.control_dt,
-            output_limits=(-2.0, 2.0),
-            integral_limit=1.0
-        )
-        
-        # 加速度内环（输出油门/刹车）
-        self.throttle_controller = PIDController(
-            kp=0.15, ki=0.04, kd=0.0, 
-            dt=self.control_dt,
-            output_limits=(0.0, 1.0),  # 输出范围是油门/刹车（特别需要注意的是0.3为油门死区，1=全油门）
-            integral_limit=10.0
+            k=st['k'],
+            epsilon=st['epsilon'],
+            max_steer=st['max_steer'],
+            filter_alpha=st['filter_alpha'],
+            lookahead_base=st['lookahead_base'],
+            lookahead_gain=st['lookahead_gain'],
+            curvature_feedforward_gain=st['curvature_feedforward_gain'],
         )
 
-        self.brake_controller = PIDController(
-            kp=0.05, ki=0.01, kd=0.0, 
-            dt=self.control_dt,
-            output_limits=(0.0, 1.0),
-            integral_limit=5.0
-        )
+        self.speed_controller = PIDController(**_pid_from_section(ctrl_cfg['speed_controller'], self.control_dt))
+        # 加速度内环（输出油门/刹车；油门死区等在控制逻辑中处理，输出上限 1=全油门）
+        self.throttle_controller = PIDController(**_pid_from_section(ctrl_cfg['throttle_controller'], self.control_dt))
+        self.brake_controller = PIDController(**_pid_from_section(ctrl_cfg['brake_controller'], self.control_dt))
         
         # 车辆物理属性（从vehicle_info获取，如果无法获取则使用默认值）
         # CARLA官方默认值：轴距约2.7m，最大转向角约70度(1.22 rad)
@@ -153,11 +248,16 @@ class CarlaVehicleControl(Node):
         
         # 线程锁
         self.data_lock = threading.Lock()
+
+        # EgoPlanningTrajectory 速度剖面：新消息到达前保持上一周期，按 (t,v) 与 header 时间戳插值
+        self._speed_prof_t: list[float] = []
+        self._speed_prof_v: list[float] = []
+        self._traj_stamp_ns: int | None = None
         
         # 调试计数器
         self.log_counter = 0
         
-        self.start_time = time.time()
+        self.start_time = self.get_clock().now()
 
         # 订阅器
         self.initialpose_sub = self.create_subscription(
@@ -189,12 +289,6 @@ class CarlaVehicleControl(Node):
             Odometry,
             '/carla/ego_vehicle/odometry',
             self.odometry_callback,
-            10
-        )
-        self.status_sub = self.create_subscription(
-            CarlaEgoVehicleStatus,
-            '/carla/ego_vehicle/vehicle_status',
-            self.status_callback,
             10
         )
         self.vehicle_info_sub = self.create_subscription(
@@ -254,6 +348,18 @@ class CarlaVehicleControl(Node):
             self.qp_path_callback,
             10
         )
+        try:
+            from map_load.msg import EgoPlanningTrajectory
+            self._EgoPlanningTrajectory = EgoPlanningTrajectory
+            self.ego_plan_traj_sub = self.create_subscription(
+                EgoPlanningTrajectory,
+                '/planning/ego_trajectory',
+                self.ego_plan_traj_callback,
+                10,
+            )
+        except ImportError:
+            self._EgoPlanningTrajectory = None
+            self.ego_plan_traj_sub = None
         
         # 状态变量：用于同步索引和点列表
         self.pending_update_index = None
@@ -292,7 +398,7 @@ class CarlaVehicleControl(Node):
     def _init_carla_connection(self):
         """初始化CARLA连接"""
         try:
-            self.carla_client = carla.Client('192.168.102.13', 2000)
+            self.carla_client = carla.Client('192.168.1.6', 2000)
             self.carla_client.set_timeout(5.0)
             self.carla_world = self.carla_client.get_world()
             self.get_logger().info(f"{GREEN}✓ CARLA连接成功{RESET}")
@@ -354,6 +460,19 @@ class CarlaVehicleControl(Node):
             carla.Rotation(pitch=0, yaw=-yaw_deg, roll=0)
         )
         self.ego_vehicle.set_transform(transform)
+
+        with self.data_lock:
+            self.qp_path = []
+            self.ref_nearest_idx = 0
+            self.traj_nearest_idx = 0
+            self._speed_prof_t = []
+            self._speed_prof_v = []
+            self._traj_stamp_ns = None
+        self.speed_controller.reset()
+        self.throttle_controller.reset()
+        self.brake_controller.reset()
+        self.stanley.filtered_cross_track_error = 0.0
+        self.stanley.filtered_heading_error = 0.0
         
         # 验证移动是否成功
         new_loc = self.ego_vehicle.get_location()
@@ -365,18 +484,6 @@ class CarlaVehicleControl(Node):
         self.get_logger().info(f"移动后位置: ({new_loc.x:.2f}, {new_loc.y:.2f}, {new_loc.z:.2f})")
         self.get_logger().info(f"移动后航向角: {new_yaw:.2f}°")
         self.get_logger().info(f"{GREEN}✓ 车辆已移动到中心线: ({x:.2f}, {y:.2f}){RESET}")
-    
-    def status_callback(self, msg):
-        """车辆状态回调"""
-        raw_velocity = msg.velocity  # m/s
-        if self.enable_noise:
-            noise_velocity = np.random.normal(0.0, self.status_noise_std_velocity)
-            self.measured_speed = raw_velocity + noise_velocity
-        else:
-            self.measured_speed = raw_velocity
-        self.filtered_actual_spd = self.filter_alpha_spd * self.measured_speed + (1 - self.filter_alpha_spd) * self.filtered_actual_spd
-        self.measured_speed = self.filtered_actual_spd
-        self.is_spd_updated = True
     
     def imu_callback(self, msg):
         """IMU回调 - 获取纵向加速度"""
@@ -503,6 +610,21 @@ class CarlaVehicleControl(Node):
     def odometry_callback(self, msg):
         """里程计回调 - 使用EKF进行状态估计"""
         with self.data_lock:
+            # 速度来自 twist（child_frame 下通常为车体前向 x、横向 y），用地速模长作 measured_speed
+            tw = msg.twist.twist.linear
+            raw_velocity = math.hypot(tw.x, tw.y)
+            if self.enable_noise:
+                noise_velocity = np.random.normal(0.0, self.status_noise_std_velocity)
+                spd_meas = raw_velocity + noise_velocity
+            else:
+                spd_meas = raw_velocity
+            self.filtered_actual_spd = (
+                self.filter_alpha_spd * spd_meas
+                + (1 - self.filter_alpha_spd) * self.filtered_actual_spd
+            )
+            self.measured_speed = self.filtered_actual_spd
+            self.is_spd_updated = True
+
             # 获取原始测量值
             raw_x = msg.pose.pose.position.x
             raw_y = msg.pose.pose.position.y
@@ -613,7 +735,7 @@ class CarlaVehicleControl(Node):
         self.path_boundary_valid = msg.valid
 
     def qp_path_callback(self, msg):
-        """QP XY 路径回调：PathData，供 Stanley 跟踪"""
+        """QP XY 路径回调：PathData，供 Stanley 跟踪（无 ego_trajectory 时的回退）"""
         points = []
         for pose in msg.poses:
             points.append((pose.pose.position.x, pose.pose.position.y))
@@ -621,6 +743,26 @@ class CarlaVehicleControl(Node):
             self.qp_path = points
             # self.qp_path_curvatures = self.compute_curvatures(points) if len(points) >= 3 else []
             self.traj_nearest_idx = 0
+
+    def ego_plan_traj_callback(self, msg):
+        points = []
+        t_list: list[float] = []
+        v_list: list[float] = []
+        for p in msg.points:
+            points.append((p.x, p.y))
+            t_list.append(float(p.t))
+            v_list.append(float(p.v))
+        recv_ns = self.get_clock().now().nanoseconds
+        stamp_ns = Time.from_msg(msg.header.stamp).nanoseconds
+        if stamp_ns <= 1e-6:
+            stamp_ns = recv_ns
+        with self.data_lock:
+            self.qp_path = points
+            self.traj_nearest_idx = 0
+            if t_list and len(t_list) == len(v_list):
+                self._speed_prof_t = t_list
+                self._speed_prof_v = v_list
+                self._traj_stamp_ns = stamp_ns
 
     def _find_nearest_idx_on_path(self, path, x, y, hint_idx=0):
         """在路径上查找距 (x,y) 最近的段起点索引"""
@@ -716,8 +858,6 @@ class CarlaVehicleControl(Node):
         # 清空目标点
         self.goal_pose = None
         
-        self.start_time = time.time()
-        
         self.get_logger().info("✓ 车辆已停止，等待设置目标点...")
     
     def goal_pose_callback(self, msg):
@@ -769,10 +909,10 @@ class CarlaVehicleControl(Node):
         
         return curvatures
     
-    # FIXME: 后期考虑用交互模型，局部避障规划或speed profile规划速度
+    # TODO: 后期考虑用交互模型，局部避障规划或speed profile规划速度
     def plan_speed(self):
         """速度规划"""
-        planned_speed = 5
+        planned_speed = 1.5
         reaction_stop_time = 5
         reaction_stop_distance = self.current_speed * reaction_stop_time
         
@@ -791,6 +931,21 @@ class CarlaVehicleControl(Node):
                 planned_speed = 0.0
         
         return float(planned_speed)
+
+    def _planned_speed_from_held_profile(
+        self, prof_t: list[float], prof_v: list[float], traj_stamp_ns: int | None
+    ) -> float | None:
+        """按轨迹 header 时钟与剖面点 (t,v) 线性插值期望速度；无有效剖面时返回 None。"""
+        if traj_stamp_ns is None or not prof_t or len(prof_t) != len(prof_v):
+            return None
+        now_ns = self.get_clock().now().nanoseconds
+        t_exec = (now_ns - traj_stamp_ns) * 1e-9
+        t_arr = np.asarray(prof_t, dtype=np.float64)
+        v_arr = np.asarray(prof_v, dtype=np.float64)
+        if t_arr.size < 1:
+            return None
+        v = float(np.interp(t_exec, t_arr, v_arr))
+        return float(np.clip(v, 0.0, self.max_speed))
     
     def publish_reference_path(self, waypoints, start_idx, current_speed):
         """
@@ -849,11 +1004,20 @@ class CarlaVehicleControl(Node):
             if not hasattr(self, 'plot_data_pub') or self.plot_data_pub is None:
                 return
             
-            current_time = time.time() - self.start_time
+            elapsed = self.get_clock().now() - self.start_time
+            current_time_s = float(elapsed.nanoseconds) * 1e-9
             plot_data = Float64MultiArray()
             plot_data.data = [
-                current_time, cross_track_error, heading_error, normalized_steer,
-                vehicle_speed, vehicle_accel, throttle, brake, speed_error, accel_error
+                current_time_s,
+                float(cross_track_error),
+                float(heading_error),
+                float(normalized_steer),
+                float(vehicle_speed),
+                float(vehicle_accel),
+                float(throttle),
+                float(brake),
+                float(speed_error),
+                float(accel_error),
             ]
             self.plot_data_pub.publish(plot_data)
         except Exception as e:
@@ -882,12 +1046,6 @@ class CarlaVehicleControl(Node):
                 # path_curvatures = self.qp_path_curvatures if qp_path else self.path_curvatures
                 start_idx = self.traj_nearest_idx if qp_path else self.ref_nearest_idx
 
-                self.get_logger().info("------------------------")
-                self.get_logger().info(f"第一个qp_path点: x={qp_path[0][0]}, y={qp_path[0][1]}")
-                self.get_logger().info(f"第二个qp_path点: x={qp_path[1][0]}, y={qp_path[1][1]}")
-                self.get_logger().info(f"第三个qp_path点: x={qp_path[2][0]}, y={qp_path[2][1]}")
-                self.get_logger().info(f"ego当前位置: x={self.current_x}, y={self.current_y}")
-
                 if not self.is_spd_updated:
                     self.current_speed += self.control_dt * self.measured_accel
                 else:
@@ -913,6 +1071,9 @@ class CarlaVehicleControl(Node):
                 current_yaw = self.current_yaw
                 current_v = self.current_speed
 
+                speed_prof_t = list(self._speed_prof_t)
+                speed_prof_v = list(self._speed_prof_v)
+                traj_stamp_ns = self._traj_stamp_ns
 
             # 检查是否到达目标
             if len(waypoints) > 0:
@@ -933,8 +1094,6 @@ class CarlaVehicleControl(Node):
             steering_angle, target_point, heading_error, cross_track_error, curvature, nearest_idx = self.stanley.compute_steering(
                 current_x, current_y, current_yaw, current_v, path_to_track, self.control_dt, self.vehicle_wheelbase, start_idx, forward_only=bool(qp_path)
             )
-
-            self.get_logger().info(f"heading_error: {heading_error}, cross_track_error: {cross_track_error}, nearest_idx: {nearest_idx}")
 
             if qp_path:
                 new_ref_idx = self._find_nearest_idx_on_path(waypoints, current_x, current_y, self.ref_nearest_idx)
@@ -957,8 +1116,12 @@ class CarlaVehicleControl(Node):
                 self.publish_reference_path(waypoints, self.ref_nearest_idx, current_v)
                 self.reference_path_counter = 0
 
-            # 速度规划
-            planned_speed = self.plan_speed()
+            # 速度：优先按上一帧起保持的 SpeedProfile (t,v) 相对轨迹 header 时间插值；无剖面时回退 plan_speed
+            planned_speed = self._planned_speed_from_held_profile(
+                speed_prof_t, speed_prof_v, traj_stamp_ns
+            )
+            if planned_speed is None:
+                planned_speed = self.plan_speed()
 
             # 更新EKF控制输入 [v, delta]
             # delta 是前轮转角，steering_angle 是 Stanley 控制器输出的转向角
@@ -978,12 +1141,12 @@ class CarlaVehicleControl(Node):
                 brake = self.brake_controller.compute(-accel_error)
                 self.filtered_actual_brake = self.filter_alpha_brake * brake + (1 - self.filter_alpha_brake) * self.filtered_actual_brake
                 brake = self.filtered_actual_brake
-                throttle = self.throttle_controller.compute(accel_error) + 0.3
+                throttle = self.throttle_controller.compute(accel_error) + self.dead_zone_throttle
                 self.filtered_actual_throttle = self.filter_alpha_throttle * throttle + (1 - self.filter_alpha_throttle) * self.filtered_actual_throttle
                 throttle = self.filtered_actual_throttle
 
             else:
-                throttle = self.throttle_controller.compute(accel_error) + 0.3
+                throttle = self.throttle_controller.compute(accel_error) + self.dead_zone_throttle
                 self.filtered_actual_throttle = self.filter_alpha_throttle * throttle + (1 - self.filter_alpha_throttle) * self.filtered_actual_throttle
                 throttle = self.filtered_actual_throttle
                 self.brake_controller.reset()
@@ -1045,7 +1208,10 @@ class CarlaVehicleControl(Node):
         self.traj_nearest_idx = 0
         self.log_counter = 0
         # self.path_curvatures = self.compute_curvatures(self.waypoints) if len(self.waypoints) >= 3 else []
-        self.start_time = time.time()
+        self.start_time = self.get_clock().now()
+
+        end_distance = math.sqrt((self.waypoints[-1][0] - self.waypoints[0][0])**2 + (self.waypoints[-1][1] - self.waypoints[0][1])**2)
+        self.get_logger().info(f"end_distance: {end_distance}")
         
         self.control_timer = self.create_timer(self.control_dt, self.control_loop)
 
