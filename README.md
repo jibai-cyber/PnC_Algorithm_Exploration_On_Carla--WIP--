@@ -12,9 +12,12 @@ See updated_version.txt
 See REAL_TIME_FACTOR_CHANGES.md and updated_version.txt(version 2.3)  
 
 # Current effect
-![Debug_Diagram](pic/Debug_Diagram.png "Debug Diagram")  
-
-![Real-time_visuals_of_Rviz_and_Carla](pic/Real-time_visuals_of_Rviz_and_Carla.png "Real-time visuals of Rviz and Carla")  
+https://github.com/user-attachments/assets/95dcb773-babf-4f57-a353-a40c0356a24b  
+| ![Debug_Diagram](pic/Debug_Diagram.png "Debug Diagram")  | 
+|:--:| 
+| *Debug Diagram* |  
+| ![Real-time_visuals_of_Rviz_and_Carla](pic/Real-time_visuals_of_Rviz_and_Carla.png "Real-time visuals of Rviz and Carla")  | 
+| *Real-time visuals of Rviz and Carla* | 
 
 ---
 
