@@ -198,13 +198,14 @@ class CarlaVehicleControl(Node):
         self.qp_path = []
         # self.qp_path_curvatures = []
         self.ref_nearest_idx = 0
-        self.traj_nearest_idx = 0
+        self.qp_nearest_idx = 0
 
         self.start_pose = None
         self.goal_pose = None
         self.wait_for_goal = True
         
         self.is_controlling = False
+        self.is_arrived = False
         self.is_spd_updated = False
         self.control_timer: Timer | None = None
 
@@ -233,7 +234,7 @@ class CarlaVehicleControl(Node):
         self.last_control_input = np.array([0.0, 0.0])  # 上一次控制输入 [v, delta]
 
         # 油门刹车切换相关参数
-        self.switch_threshold = 0.05
+        self.switch_threshold = 1.0
         
         # 路径曲率
         self.path_curvatures = []
@@ -249,11 +250,15 @@ class CarlaVehicleControl(Node):
         # 线程锁
         self.data_lock = threading.Lock()
 
-        # EgoPlanningTrajectory 速度剖面：新消息到达前保持上一周期，按 (t,v) 与 header 时间戳插值
+        # EgoPlanningTrajectory：按 header 锚定的相对时间 t 插值 v 与横向参考 (x,y,theta)
         self._speed_prof_t: list[float] = []
         self._speed_prof_v: list[float] = []
+        self._traj_px: list[float] = []
+        self._traj_py: list[float] = []
+        self._traj_ptheta: list[float] = []
         self._traj_stamp_ns: int | None = None
-        
+        self._last_planning_anomaly_log_ns: int = 0
+
         # 调试计数器
         self.log_counter = 0
         
@@ -464,13 +469,17 @@ class CarlaVehicleControl(Node):
         with self.data_lock:
             self.qp_path = []
             self.ref_nearest_idx = 0
-            self.traj_nearest_idx = 0
+            self.qp_nearest_idx = 0
             self._speed_prof_t = []
             self._speed_prof_v = []
+            self._traj_px = []
+            self._traj_py = []
+            self._traj_ptheta = []
             self._traj_stamp_ns = None
         self.speed_controller.reset()
         self.throttle_controller.reset()
         self.brake_controller.reset()
+        self.is_arrived = False
         self.stanley.filtered_cross_track_error = 0.0
         self.stanley.filtered_heading_error = 0.0
         
@@ -506,10 +515,6 @@ class CarlaVehicleControl(Node):
         try:
             # 获取车辆类型ID
             self.vehicle_type_id = msg.id
-            
-            # 获取轴距（wheelbase）
-            # CARLA的vehicle_info中，wheelbase可能在wheels信息中
-            # 或者需要通过前后轮位置计算
             if hasattr(msg, 'wheels') and len(msg.wheels) > 0:
                 self.vehicle_wheel_count = len(msg.wheels)
                 self.vehicle_wheel_info = []
@@ -735,34 +740,64 @@ class CarlaVehicleControl(Node):
         self.path_boundary_valid = msg.valid
 
     def qp_path_callback(self, msg):
-        """QP XY 路径回调：PathData，供 Stanley 跟踪（无 ego_trajectory 时的回退）"""
+        """兼容旧 QP Path：仅更新几何折线；清空时间锚定剖面，直至收到 EgoPlanningTrajectory。"""
         points = []
         for pose in msg.poses:
             points.append((pose.pose.position.x, pose.pose.position.y))
         with self.data_lock:
             self.qp_path = points
-            # self.qp_path_curvatures = self.compute_curvatures(points) if len(points) >= 3 else []
-            self.traj_nearest_idx = 0
+            if len(points) < 2:
+                self.qp_nearest_idx = 0
+            self._speed_prof_t = []
+            self._speed_prof_v = []
+            self._traj_px = []
+            self._traj_py = []
+            self._traj_ptheta = []
+            self._traj_stamp_ns = None
 
     def ego_plan_traj_callback(self, msg):
         points = []
         t_list: list[float] = []
         v_list: list[float] = []
+        x_list: list[float] = []
+        y_list: list[float] = []
+        th_list: list[float] = []
         for p in msg.points:
             points.append((p.x, p.y))
             t_list.append(float(p.t))
             v_list.append(float(p.v))
+            x_list.append(float(p.x))
+            y_list.append(float(p.y))
+            th_list.append(float(p.theta))
         recv_ns = self.get_clock().now().nanoseconds
         stamp_ns = Time.from_msg(msg.header.stamp).nanoseconds
         if stamp_ns <= 1e-6:
             stamp_ns = recv_ns
         with self.data_lock:
             self.qp_path = points
-            self.traj_nearest_idx = 0
-            if t_list and len(t_list) == len(v_list):
+            if len(points) < 2:
+                self.qp_nearest_idx = 0
+            if (
+                t_list
+                and len(t_list) == len(v_list)
+                and len(x_list) == len(t_list)
+                and len(y_list) == len(t_list)
+                and len(th_list) == len(t_list)
+            ):
                 self._speed_prof_t = t_list
                 self._speed_prof_v = v_list
+                self._traj_px = x_list
+                self._traj_py = y_list
+                self._traj_ptheta = th_list
                 self._traj_stamp_ns = stamp_ns
+            else:
+                self.qp_nearest_idx = 0
+                self._speed_prof_t = []
+                self._speed_prof_v = []
+                self._traj_px = []
+                self._traj_py = []
+                self._traj_ptheta = []
+                self._traj_stamp_ns = None
 
     def _find_nearest_idx_on_path(self, path, x, y, hint_idx=0):
         """在路径上查找距 (x,y) 最近的段起点索引"""
@@ -822,6 +857,7 @@ class CarlaVehicleControl(Node):
         self.get_logger().info("收到起点，车辆已放置")
         self.start_pose = msg.pose.pose
         self.wait_for_goal = True
+        self.is_arrived = False
         
         # 停止当前控制
         if self.is_controlling and self.control_timer:
@@ -836,10 +872,15 @@ class CarlaVehicleControl(Node):
             self.waypoints = []
             self.current_waypoint_index = 0
             self.qp_path = []
-            # self.qp_path_curvatures = []
             self.ref_nearest_idx = 0
-            self.traj_nearest_idx = 0
+            self.qp_nearest_idx = 0
             self.path_curvatures = []
+            self._speed_prof_t = []
+            self._speed_prof_v = []
+            self._traj_px = []
+            self._traj_py = []
+            self._traj_ptheta = []
+            self._traj_stamp_ns = None
         
         # 重置控制相关状态
         self.speed_controller.reset()
@@ -932,19 +973,52 @@ class CarlaVehicleControl(Node):
         
         return float(planned_speed)
 
+    def _planning_exec_tau_sec(
+        self, traj_stamp_ns: int | None, prof_t: list[float]
+    ) -> tuple[float | None, float, float]:
+        """
+        与 _planned_speed_from_held_profile 相同的时间轴：tau_raw = now - stamp。
+        返回 (tau_clamped, tau_raw, t_max)。无效时 (None, _, _)。
+        """
+        if traj_stamp_ns is None or not prof_t:
+            return None, 0.0, 0.0
+        now_ns = self.get_clock().now().nanoseconds
+        tau_raw = (now_ns - traj_stamp_ns) * 1e-9
+        t_max = float(max(prof_t))
+        reasons: list[str] = []
+        if tau_raw < 0.0:
+            reasons.append("tau<0")
+        if tau_raw > t_max:
+            reasons.append("tau>t_last")
+        tau = float(np.clip(tau_raw, 0.0, t_max))
+        if reasons:
+            if now_ns - self._last_planning_anomaly_log_ns >= 1_000_000_000:
+                self.get_logger().error(
+                    f"规划器时间异常（已夹紧插值）: {', '.join(reasons)}; "
+                    f"tau_raw={tau_raw:.3f}s -> tau={tau:.3f}s, t_max={t_max:.3f}s"
+                )
+                self._last_planning_anomaly_log_ns = now_ns
+        return tau, tau_raw, t_max
+
     def _planned_speed_from_held_profile(
-        self, prof_t: list[float], prof_v: list[float], traj_stamp_ns: int | None
+        self,
+        prof_t: list[float],
+        prof_v: list[float],
+        traj_stamp_ns: int | None,
+        tau_clamped: float | None = None,
     ) -> float | None:
         """按轨迹 header 时钟与剖面点 (t,v) 线性插值期望速度；无有效剖面时返回 None。"""
-        if traj_stamp_ns is None or not prof_t or len(prof_t) != len(prof_v):
+        if not prof_t or len(prof_t) != len(prof_v):
             return None
-        now_ns = self.get_clock().now().nanoseconds
-        t_exec = (now_ns - traj_stamp_ns) * 1e-9
+        if tau_clamped is None:
+            tau, _, _ = self._planning_exec_tau_sec(traj_stamp_ns, prof_t)
+            if tau is None:
+                return None
+        else:
+            tau = tau_clamped
         t_arr = np.asarray(prof_t, dtype=np.float64)
         v_arr = np.asarray(prof_v, dtype=np.float64)
-        if t_arr.size < 1:
-            return None
-        v = float(np.interp(t_exec, t_arr, v_arr))
+        v = float(np.interp(tau, t_arr, v_arr))
         return float(np.clip(v, 0.0, self.max_speed))
     
     def publish_reference_path(self, waypoints, start_idx, current_speed):
@@ -1042,9 +1116,12 @@ class CarlaVehicleControl(Node):
                     return
                 waypoints = self.waypoints.copy()
                 qp_path = self.qp_path.copy() if self.qp_path else []
-                path_to_track = qp_path if qp_path else waypoints
-                # path_curvatures = self.qp_path_curvatures if qp_path else self.path_curvatures
-                start_idx = self.traj_nearest_idx if qp_path else self.ref_nearest_idx
+                speed_prof_t = list(self._speed_prof_t)
+                speed_prof_v = list(self._speed_prof_v)
+                traj_px = list(self._traj_px)
+                traj_py = list(self._traj_py)
+                traj_ptheta = list(self._traj_ptheta)
+                traj_stamp_ns = self._traj_stamp_ns
 
                 if not self.is_spd_updated:
                     self.current_speed += self.control_dt * self.measured_accel
@@ -1071,39 +1148,69 @@ class CarlaVehicleControl(Node):
                 current_yaw = self.current_yaw
                 current_v = self.current_speed
 
-                speed_prof_t = list(self._speed_prof_t)
-                speed_prof_v = list(self._speed_prof_v)
-                traj_stamp_ns = self._traj_stamp_ns
+            # 横向依赖带时间的 Ego 轨迹；无则停车（不再回退全局 waypoints）
+            if (
+                len(qp_path) < 2
+                or traj_stamp_ns is None
+                or len(speed_prof_t) < 2
+                or len(traj_px) < 2
+                or len(traj_py) < 2
+                or len(traj_ptheta) < 2
+            ):
+                self.publish_stop()
+                return
+
+            tau_plan, _, _ = self._planning_exec_tau_sec(traj_stamp_ns, speed_prof_t)
+            if tau_plan is None:
+                self.publish_stop()
+                return
 
             # 检查是否到达目标
             if len(waypoints) > 0:
                 goal = waypoints[-1]
                 dist_to_goal = math.sqrt((current_x - goal[0])**2 + (current_y - goal[1])**2)
                 
-                if dist_to_goal < 1.0:
+                if dist_to_goal < 0.5 and not self.is_arrived:
                     self.get_logger().info(f"{GREEN}🎯 已到达目标点！{RESET}")
                     self.publish_stop()
+                    self.is_arrived = True
                     self.is_controlling = False
                     # ====== Humble适配：定时器取消+销毁 ======
                     if hasattr(self, 'control_timer') and self.control_timer is not None:
                         if not self.control_timer.is_canceled():
                             self.control_timer.cancel()
                     return
-            
-            # 使用Stanley控制器计算转向角
-            steering_angle, target_point, heading_error, cross_track_error, curvature, nearest_idx = self.stanley.compute_steering(
-                current_x, current_y, current_yaw, current_v, path_to_track, self.control_dt, self.vehicle_wheelbase, start_idx, forward_only=bool(qp_path)
+
+            self.qp_nearest_idx = self._find_nearest_idx_on_path(
+                qp_path, current_x, current_y, self.qp_nearest_idx
             )
 
-            if qp_path:
-                new_ref_idx = self._find_nearest_idx_on_path(waypoints, current_x, current_y, self.ref_nearest_idx)
-                with self.data_lock:
-                    self.traj_nearest_idx = nearest_idx
-                    self.ref_nearest_idx = new_ref_idx
-            else:
-                with self.data_lock:
-                    self.ref_nearest_idx = nearest_idx
-                    self.current_waypoint_index = nearest_idx
+            (
+                steering_angle,
+                target_point,
+                heading_error,
+                cross_track_error,
+                curvature,
+                _seg_idx,
+            ) = self.stanley.compute_steering_time_anchor(
+                current_x,
+                current_y,
+                current_yaw,
+                current_v,
+                speed_prof_t,
+                traj_px,
+                traj_py,
+                traj_ptheta,
+                tau_plan,
+                fallback_path=qp_path,
+                fallback_start_idx=self.qp_nearest_idx,
+            )
+
+            new_ref_idx = self._find_nearest_idx_on_path(
+                waypoints, current_x, current_y, self.ref_nearest_idx
+            )
+            with self.data_lock:
+                self.ref_nearest_idx = new_ref_idx
 
             # 发布参考线最近索引供 path_smoother / vehicle_perception 使用
             nearest_idx_msg = Int32()
@@ -1118,7 +1225,7 @@ class CarlaVehicleControl(Node):
 
             # 速度：优先按上一帧起保持的 SpeedProfile (t,v) 相对轨迹 header 时间插值；无剖面时回退 plan_speed
             planned_speed = self._planned_speed_from_held_profile(
-                speed_prof_t, speed_prof_v, traj_stamp_ns
+                speed_prof_t, speed_prof_v, traj_stamp_ns, tau_clamped=tau_plan
             )
             if planned_speed is None:
                 planned_speed = self.plan_speed()
@@ -1164,8 +1271,8 @@ class CarlaVehicleControl(Node):
 
             # 更新误差可视化（绘图）
             self._update_error_visualization(
-                self.stanley.current_cross_track_error,
-                self.stanley.current_heading_error,
+                cross_track_error,
+                heading_error,
                 normalized_steer,
                 current_v,
                 self.measured_accel,
@@ -1205,17 +1312,12 @@ class CarlaVehicleControl(Node):
         # 重置控制状态
         self.current_waypoint_index = 0
         self.ref_nearest_idx = 0
-        self.traj_nearest_idx = 0
+        self.qp_nearest_idx = 0
         self.log_counter = 0
         # self.path_curvatures = self.compute_curvatures(self.waypoints) if len(self.waypoints) >= 3 else []
         self.start_time = self.get_clock().now()
-
-        end_distance = math.sqrt((self.waypoints[-1][0] - self.waypoints[0][0])**2 + (self.waypoints[-1][1] - self.waypoints[0][1])**2)
-        self.get_logger().info(f"end_distance: {end_distance}")
-        
-        self.control_timer = self.create_timer(self.control_dt, self.control_loop)
-
-        self.get_logger().info(f"{GREEN}🚀 启动车辆控制！路径包含 {len(self.waypoints)} 个点{RESET}")
+        if not self.is_arrived:
+            self.control_timer = self.create_timer(self.control_dt, self.control_loop)
 
     def run(self):
         """主循环"""

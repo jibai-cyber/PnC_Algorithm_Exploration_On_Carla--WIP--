@@ -120,14 +120,98 @@ class StanleyController:
             heading_error = math.atan2(nearest_seg_unitvec[1], nearest_seg_unitvec[0]) - current_yaw
             heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
 
-        self.current_heading_error = heading_error
-        self.current_cross_track_error = cross_track_error
-        
         if current_v < 0.6:
             steer_correction = heading_error + np.arctan2(self.k * cross_track_error, current_v + self.epsilon)
         else:
             steer_correction = heading_error + np.arctan2(self.k * cross_track_error, current_v)
         steering_angle = np.clip(steer_correction, -self.max_steer, self.max_steer)
-        
-        
+
         return steering_angle, (float(lookahead_point[0]), float(lookahead_point[1])), heading_error, cross_track_error, curvature, nearest_idx
+
+    def compute_steering_time_anchor(
+        self,
+        current_x: float,
+        current_y: float,
+        current_yaw: float,
+        current_v: float,
+        traj_t: list,
+        traj_x: list,
+        traj_y: list,
+        traj_theta: list,
+        tau: float,
+        fallback_path=None,
+        fallback_start_idx: int = 0,
+    ):
+        """
+        按规划相对时间 tau 在轨迹上插值参考位姿，用参考航向定义横向误差（左正）。
+        tau 建议已由上层夹在 [0, t_last]。
+
+        若锚点相对车体航向在前方投影为负（参考点在 ego 后方），时间锚横向律不可靠，
+        此时若提供 ``fallback_path``（如 qp_path），则改用 ``compute_steering`` 几何 Stanley。
+        """
+        if len(traj_t) < 2 or len(traj_x) != len(traj_t) or len(traj_y) != len(traj_t):
+            return (
+                0.0,
+                (float(current_x), float(current_y)),
+                0.0,
+                0.0,
+                0.0,
+                0,
+            )
+        if len(traj_theta) != len(traj_t):
+            traj_theta = list(traj_theta)
+            while len(traj_theta) < len(traj_t):
+                traj_theta.append(traj_theta[-1] if traj_theta else 0.0)
+            traj_theta = traj_theta[: len(traj_t)]
+
+        t_arr = np.asarray(traj_t, dtype=np.float64)
+        x_arr = np.asarray(traj_x, dtype=np.float64)
+        y_arr = np.asarray(traj_y, dtype=np.float64)
+        th_arr = np.asarray(traj_theta, dtype=np.float64)
+        if np.nanmax(th_arr) - np.nanmin(th_arr) > math.pi:
+            th_arr = np.unwrap(th_arr)
+
+        xr = float(np.interp(tau, t_arr, x_arr))
+        yr = float(np.interp(tau, t_arr, y_arr))
+        thr = float(np.interp(tau, t_arr, th_arr))
+
+        dx = xr - current_x
+        dy = yr - current_y
+        dot_product = dx * math.cos(current_yaw) + dy * math.sin(current_yaw)
+        if dot_product < -1e-6:
+            if fallback_path is not None and len(fallback_path) >= 3:
+                return self.compute_steering(
+                    current_x,
+                    current_y,
+                    current_yaw,
+                    current_v,
+                    fallback_path,
+                    start_idx=fallback_start_idx,
+                    forward_only=True,
+                )
+        cross_track_error = -math.sin(thr) * dx + math.cos(thr) * dy
+        heading_error = math.atan2(
+            math.sin(thr - current_yaw), math.cos(thr - current_yaw)
+        )
+
+        if current_v < 0.6:
+            steer_correction = heading_error + math.atan2(
+                self.k * cross_track_error, current_v + self.epsilon
+            )
+        else:
+            steer_correction = heading_error + math.atan2(
+                self.k * cross_track_error, current_v
+            )
+        steering_angle = float(np.clip(steer_correction, -self.max_steer, self.max_steer))
+
+        seg_idx = int(np.searchsorted(t_arr, tau, side="right") - 1)
+        seg_idx = max(0, min(seg_idx, len(traj_t) - 2))
+
+        return (
+            steering_angle,
+            (xr, yr),
+            heading_error,
+            cross_track_error,
+            0.0,
+            seg_idx,
+        )

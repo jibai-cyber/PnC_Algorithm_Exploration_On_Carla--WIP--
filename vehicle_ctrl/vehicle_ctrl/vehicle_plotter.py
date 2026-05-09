@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 import threading
+from typing import Optional
 
 # 颜色定义
 RED = "\033[31m"
@@ -153,6 +154,7 @@ class VehiclePlotter(Node):
         )
 
         self.current_st_graph = None
+        self.current_dp_st_path = None
         if STGraph is not None:
             self.st_graph_sub = self.create_subscription(
                 STGraph,
@@ -162,6 +164,13 @@ class VehiclePlotter(Node):
             )
         else:
             self.st_graph_sub = None
+
+        self.dp_st_curve_sub = self.create_subscription(
+            Path,
+            '/planning/dp_st_curve',
+            self.dp_st_curve_callback,
+            10,
+        )
 
         # 初始化绘图
         if self.enable_plotting:
@@ -277,27 +286,44 @@ class VehiclePlotter(Node):
             self.get_logger().warn(f"处理 PathBoundary 失败: {e}")
 
     def st_graph_callback(self, msg):
-        """ST 图（障碍在 t-s 平面的轴对齐矩形）"""
+        """ST 图：stamps_display 为离散时刻的不可行 s 区间（粗采样），绘图时在相邻 stamp 间填充四边形。"""
         if not self.enable_plotting:
             return
         try:
             with self.data_lock:
-                self.current_st_graph = {
-                    't_horizon': float(msg.t_horizon),
-                    'regions': [
+                disp = []
+                for r in msg.stamps_display:
+                    disp.append(
                         {
                             'id': r.obstacle_id,
                             'static': bool(r.is_static),
                             's_low': float(r.s_low),
                             's_high': float(r.s_high),
-                            't_min': float(r.t_min),
-                            't_max': float(r.t_max),
+                            't': float(r.t),
                         }
-                        for r in msg.regions
-                    ],
+                    )
+                self.current_st_graph = {
+                    't_horizon': float(msg.t_horizon),
+                    'stamps_display': disp,
                 }
         except Exception as e:
             self.get_logger().warn(f"处理 STGraph 失败: {e}")
+
+    def dp_st_curve_callback(self, msg: Path):
+        """speed_planner 发布的 DP 轨迹：pose.position.x=t, y=s。"""
+        if not self.enable_plotting:
+            return
+        try:
+            if len(msg.poses) == 0:
+                with self.data_lock:
+                    self.current_dp_st_path = None
+                return
+            ts = [float(ps.pose.position.x) for ps in msg.poses]
+            ss = [float(ps.pose.position.y) for ps in msg.poses]
+            with self.data_lock:
+                self.current_dp_st_path = {'t': ts, 's': ss}
+        except Exception as e:
+            self.get_logger().warn(f"处理 DP ST 曲线失败: {e}")
 
     def qp_frenet_path_callback(self, msg):
         """QP Frenet 路径回调：nav_msgs/Path 中 x=s, y=l"""
@@ -446,10 +472,17 @@ class VehiclePlotter(Node):
                 current_path_boundary = self.current_path_boundary.copy() if self.current_path_boundary else None
                 current_qp_frenet = self.current_qp_frenet_path.copy() if self.current_qp_frenet_path else None
                 current_st_graph = self.current_st_graph
+                current_dp_st = (
+                    dict(self.current_dp_st_path) if self.current_dp_st_path is not None else None
+                )
 
             if len(time_data) == 0:
                 if STGraph is not None and current_st_graph is not None:
-                    self._redraw_st_graph(self.ax3, current_st_graph)
+                    self._redraw_st_graph(self.ax3, current_st_graph, current_dp_st)
+                elif current_dp_st is not None:
+                    self._redraw_st_graph(
+                        self.ax3, {'t_horizon': 5.0, 'stamps_display': []}, current_dp_st
+                    )
                 return
 
             # 更新s-l当前点（只显示当前坐标点，不显示历史轨迹）
@@ -568,7 +601,7 @@ class VehiclePlotter(Node):
 
             # ST 图（t–s，障碍矩形），置于 ax3
             if STGraph is not None and current_st_graph is not None:
-                self._redraw_st_graph(self.ax3, current_st_graph)
+                self._redraw_st_graph(self.ax3, current_st_graph, current_dp_st)
 
             # 刷新图形
             self.fig.canvas.draw()
@@ -577,37 +610,79 @@ class VehiclePlotter(Node):
         except Exception as e:
             self.get_logger().warn(f"更新绘图失败: {e}")
 
-    def _redraw_st_graph(self, ax, st_data: dict) -> None:
-        from matplotlib.patches import Rectangle
+    def _redraw_st_graph(self, ax, st_data: dict, dp_st: Optional[dict] = None) -> None:
+        from collections import defaultdict
+
+        from matplotlib.patches import Polygon
 
         ax.clear()
         ax.set_xlabel('t (s)', fontsize=10)
         ax.set_ylabel('s (m)', fontsize=10)
-        ax.set_title('ST obstacles (blue=static, orange=dynamic)', fontsize=11)
+        ax.set_title('ST obstacles + DP coarse (t–s)', fontsize=11)
         ax.grid(True, alpha=0.3)
         th = float(st_data.get('t_horizon', 5.0))
         smax = 10.0
         smin_ax = 0.0
-        for r in st_data.get('regions', []):
-            smax = max(smax, r['s_high'] + 2.0, abs(r['s_low']) + 2.0)
-            smin_ax = min(smin_ax, r['s_low'] - 1.0)
-            w = max(r['t_max'] - r['t_min'], 1e-6)
-            h = max(r['s_high'] - r['s_low'], 1e-6)
-            fc = (0.2, 0.45, 0.95, 0.35) if r['static'] else (0.95, 0.55, 0.15, 0.35)
-            ec = 'navy' if r['static'] else 'darkorange'
-            ax.add_patch(
-                Rectangle(
-                    (r['t_min'], r['s_low']),
-                    w,
-                    h,
+        stamps = st_data.get('stamps_display') or []
+        st_by_id = defaultdict(list)
+        for r in stamps:
+            st_by_id[r['id']].append(r)
+        single_stamp_t_width = 0.25  # 与 speed_planner OBS_SAMPLE_DT 一致，单点条带宽度
+        for _oid, seq in st_by_id.items():
+            seq.sort(key=lambda x: x['t'])
+            for r in seq:
+                smax = max(smax, r['s_high'] + 2.0, abs(r['s_low']) + 2.0)
+                smin_ax = min(smin_ax, r['s_low'] - 1.0)
+            static0 = bool(seq[0]['static']) if seq else False
+            fc = (0.2, 0.45, 0.95, 0.35) if static0 else (0.95, 0.55, 0.15, 0.35)
+            ec = 'navy' if static0 else 'darkorange'
+            if len(seq) == 1:
+                r = seq[0]
+                tw = single_stamp_t_width
+                slo, shi = r['s_low'], r['s_high']
+                h = max(shi - slo, 0.15)
+                mid = 0.5 * (slo + shi)
+                slo, shi = mid - 0.5 * h, mid + 0.5 * h
+                t0 = max(0.0, r['t'] - 0.5 * tw)
+                poly = Polygon(
+                    [(t0, slo), (t0 + tw, slo), (t0 + tw, shi), (t0, shi)],
+                    closed=True,
                     facecolor=fc,
                     edgecolor=ec,
-                    linewidth=1.2,
+                    linewidth=1.0,
                 )
-            )
+                ax.add_patch(poly)
+            else:
+                for i in range(len(seq) - 1):
+                    a, b = seq[i], seq[i + 1]
+                    poly = Polygon(
+                        [
+                            (a['t'], a['s_low']),
+                            (b['t'], b['s_low']),
+                            (b['t'], b['s_high']),
+                            (a['t'], a['s_high']),
+                        ],
+                        closed=True,
+                        facecolor=fc,
+                        edgecolor=ec,
+                        linewidth=1.0,
+                    )
+                    ax.add_patch(poly)
+        if dp_st is not None and dp_st.get('t') and dp_st.get('s'):
+            dpt = dp_st['t']
+            dps = dp_st['s']
+            if len(dpt) >= 2:
+                ax.plot(dpt, dps, color='cyan', linewidth=2.2, linestyle='-', label='DP ST', zorder=6)
+                smax = max(smax, max(dps) + 1.0)
+                smin_ax = min(smin_ax, min(dps) - 1.0)
+            elif len(dpt) == 1:
+                ax.plot([dpt[0], dpt[0] + 0.05], [dps[0], dps[0]], color='cyan', linewidth=2.2, zorder=6)
         ax.set_xlim(0, max(th, 0.5))
         ax.set_ylim(smin_ax, max(smax, 5.0))
         ax.axhline(0, color='k', linewidth=0.6, linestyle='--', alpha=0.6)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, loc='upper left', fontsize=8)
 
 
 def main(args=None):

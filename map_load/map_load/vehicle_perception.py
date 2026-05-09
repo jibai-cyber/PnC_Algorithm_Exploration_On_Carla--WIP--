@@ -1589,7 +1589,6 @@ class VehiclePerception(Node):
         s_max = float(prev_s[-1])
         if ego_s_on_prev < s_min - 1e-6 or ego_s_on_prev > s_max + 1e-6:
             # ego 超出上周期 QP 解范围，使用当前 ego 的 l 值
-            self.get_logger().warn("ego 超出上周期 QP 解范围，使用当前 ego 的 l 值")
             return (l_init, 0.0, 0.0)
 
         # 在 ego_s_on_prev 处插值上周期的 QP 解
@@ -1653,7 +1652,8 @@ class VehiclePerception(Node):
         static_obs_condition = any(
             o.get("consider", False)
             and o.get("is_static", False)
-            and len(union_merged) > 0 and union_merged[0][1] >= -K_ZERO_VAL
+            and len(union_merged) > 0 
+            and union_merged[0][1] >= -K_ZERO_VAL and union_merged[0][0] <= K_ZERO_VAL
             and self.borrow_judge_flag
             for o in obs_info_list
         )
@@ -1883,6 +1883,7 @@ class VehiclePerception(Node):
                 # 初始状态：从上周期 QP 解插值获取 (l, dl, ddl)，实现平滑衔接
                 # 将本周期的 ego xy 投影到上周期的参考线上获取真实 ego_s，再插值 QP 解
                 # TODO: 当前相当于是估计值，后续需要融合传感器数值进行卡尔曼滤波获得更精确的初值
+                # NOTE: 当前规划起点相当于是ego当前位置，而非下个周期的起点位置。
                 lo0, hi0 = path_bound_qp[0, 0], path_bound_qp[0, 1]
                 l_init, dl_init, ddl_init = self._get_init_state_from_prev_solution(
                     ego_xy=ego_xy,  # 本周期的 ego xy 投影到上周期的参考线

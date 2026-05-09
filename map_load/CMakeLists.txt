@@ -23,7 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/LocalPlanningPath.msg"
   "msg/PlanningSpeedProfile.msg"
   "msg/EgoPlanningTrajectory.msg"
-  "msg/STObstacleRegion.msg"
+  "msg/STObstacleStamp.msg"
   "msg/STGraph.msg"
   "msg/PlanningObstacle.msg"
   "msg/PlanningObstacleArray.msg"
