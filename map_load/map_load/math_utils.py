@@ -132,6 +132,54 @@ def compute_path_profile(xy_points: np.ndarray, point_spacing: float = 1.0) -> T
     return headings, accumulated_s, kappas, dkappas, seg_len_flag
 
 
+def compute_path_curvatures_triangle(
+    path: List[Tuple[float, float]],
+    closed: bool = False,
+) -> List[float]:
+    n = len(path)
+    if n < 3:
+        return [0.0] * n
+
+    def triplet_indices(i: int) -> Tuple[int, int, int]:
+        if closed:
+            return (i - 1) % n, i, (i + 1) % n
+        if i == 0:
+            return 0, 1, 2
+        if i == n - 1:
+            return n - 3, n - 2, n - 1
+        return i - 1, i, i + 1
+
+    curvatures: List[float] = []
+    for i in range(n):
+        ia, ib, ic = triplet_indices(i)
+        p_prev = np.array(path[ia], dtype=float)
+        p = np.array(path[ib], dtype=float)
+        p_next = np.array(path[ic], dtype=float)
+
+        ab = p - p_prev
+        bc = p_next - p
+        ca = p_prev - p_next
+
+        lab = float(np.linalg.norm(ab))
+        lbc = float(np.linalg.norm(bc))
+        lca = float(np.linalg.norm(ca))
+
+        denom = lab * lbc * lca
+        if denom < 1e-6:
+            curvatures.append(0.0)
+            continue
+
+        area = abs(float(np.cross(ab, (p_next - p_prev)))) * 0.5
+        kappa = 4.0 * area / denom
+
+        cross = (p[0] - p_prev[0]) * (p_next[1] - p_prev[1]) - (p[1] - p_prev[1]) * (p_next[0] - p_prev[0])
+        if cross < 0.0:
+            kappa = -kappa
+        curvatures.append(float(kappa))
+
+    return curvatures
+
+
 def cartesian_to_frenet_simple(
     rs: float,
     rx: float,

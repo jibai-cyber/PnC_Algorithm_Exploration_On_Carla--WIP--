@@ -408,10 +408,10 @@ class VehiclePerception(Node):
             10,
         )
 
-        # QP XY 路径（优先使用 ego_trajectory）
-        self.qp_xy_path_pub = self.create_publisher(
+        # 5s 执行轨迹 XY（与 EgoPlanningTrajectory 同源，供 Rviz）
+        self.ego_trajectory_path_pub = self.create_publisher(
             Path,
-            '/path_smoothing/qp_xy_path',
+            '/planning/ego_trajectory_path',
             10,
         )
 
@@ -895,10 +895,30 @@ class VehiclePerception(Node):
         p = path_pts[-1]
         return p.x, p.y, p.theta
 
+    def _path_msg_from_trajectory_points(
+        self, header, traj_points: list
+    ) -> Path:
+        """EgoPlanningTrajectory.points → nav_msgs/Path（5s 执行轨迹可视化）。"""
+        path_msg = Path()
+        path_msg.header = header
+        for tp in traj_points:
+            ps = PoseStamped()
+            ps.header = path_msg.header
+            ps.pose.position.x = float(tp.x)
+            ps.pose.position.y = float(tp.y)
+            ps.pose.position.z = 0.0
+            qx, qy, qz, qw = self._yaw_to_quat(float(tp.theta))
+            ps.pose.orientation.x = qx
+            ps.pose.orientation.y = qy
+            ps.pose.orientation.z = qz
+            ps.pose.orientation.w = qw
+            path_msg.poses.append(ps)
+        return path_msg
+
     def _publish_local_planning_and_trajectory(
         self, planning_path_pts: list, stamp
     ) -> None:
-        """发布 LocalPlanningPath、nav Path、EgoPlanningTrajectory"""
+        """发布 LocalPlanningPath、EgoPlanningTrajectory、ego_trajectory_path"""
         if (
             self.local_planning_path_pub is None
             or LocalPlanningPath is None
@@ -913,23 +933,6 @@ class VehiclePerception(Node):
         lp.points = planning_path_pts
         lp.corridor_length_s = corridor_L
         self.local_planning_path_pub.publish(lp)
-
-        if self.qp_xy_path_pub is not None:
-            path_msg = Path()
-            path_msg.header = lp.header
-            for p in planning_path_pts:
-                ps = PoseStamped()
-                ps.header = path_msg.header
-                ps.pose.position.x = p.x
-                ps.pose.position.y = p.y
-                ps.pose.position.z = 0.0
-                qx, qy, qz, qw = self._yaw_to_quat(p.theta)
-                ps.pose.orientation.x = qx
-                ps.pose.orientation.y = qy
-                ps.pose.orientation.z = qz
-                ps.pose.orientation.w = qw
-                path_msg.poses.append(ps)
-            self.qp_xy_path_pub.publish(path_msg)
 
         if self._planning_speed_invalid or self._speed_profile_resampled is None:
             return
@@ -954,8 +957,14 @@ class VehiclePerception(Node):
                 tp.v = 0.0
                 tp.a = 0.0
             traj.points.append(tp)
-        if self.ego_trajectory_pub is not None and traj.points:
+        if not traj.points:
+            return
+        if self.ego_trajectory_pub is not None:
             self.ego_trajectory_pub.publish(traj)
+        if self.ego_trajectory_path_pub is not None:
+            self.ego_trajectory_path_pub.publish(
+                self._path_msg_from_trajectory_points(traj.header, traj.points)
+            )
 
     @staticmethod
     def _yaw_to_quat(yaw: float) -> tuple[float, float, float, float]:
@@ -1993,7 +2002,7 @@ class VehiclePerception(Node):
                 ppts = self._xy_list_to_planning_path_points(xy_trunc)
                 if ppts:
                     self._publish_local_planning_and_trajectory(ppts, stamp)
-            elif self.qp_xy_path_pub is not None:
+            elif self.ego_trajectory_path_pub is not None:
                 path_msg = Path()
                 path_msg.header.frame_id = "map"
                 path_msg.header.stamp = stamp
@@ -2005,7 +2014,7 @@ class VehiclePerception(Node):
                     ps.pose.position.z = 0.0
                     ps.pose.orientation.w = 1.0
                     path_msg.poses.append(ps)
-                self.qp_xy_path_pub.publish(path_msg)
+                self.ego_trajectory_path_pub.publish(path_msg)
 
         except Exception as e:
             self.get_logger().error(f"QP 路径规划或发布失败: {e}")

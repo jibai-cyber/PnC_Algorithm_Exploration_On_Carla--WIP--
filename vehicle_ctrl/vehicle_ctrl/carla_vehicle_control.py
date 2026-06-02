@@ -8,11 +8,10 @@ from rclpy.timer import Timer
 from rclpy.time import Time
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import Imu
 from std_msgs.msg import Float64MultiArray, Int32
-from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleInfo
+from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleInfo, CarlaEgoVehicleStatus
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from tf_transformations import euler_from_quaternion
+from tf_transformations import euler_from_quaternion, quaternion_matrix
 import copy
 import json
 import math
@@ -30,6 +29,17 @@ from .stanley_controller import StanleyController
 from .pid_controller import PIDController
 from .bicycle_model_ekf import BicycleModelEKF
 from .constants import GREEN, CYAN, RESET
+
+# 合速度低于此值时侧偏角置零，避免 atan2 噪声
+BETA_ZERO_SPEED_THRESH_MPS = 0.15
+
+
+def _body_beta_and_speed_mag(vx: float, vy: float) -> tuple[float, float]:
+    """车体系纵/横向速度 → (侧偏角 β, 合速度)。"""
+    v_mag = float(math.hypot(vx, vy))
+    if v_mag < BETA_ZERO_SPEED_THRESH_MPS:
+        return 0.0, v_mag
+    return float(math.atan2(vy, vx)), v_mag
 
 
 def _default_carla_control_params():
@@ -185,7 +195,17 @@ class CarlaVehicleControl(Node):
         self.measured_y = 0.0
         self.measured_yaw = 0.0
         self.measured_speed = 0.0  # m/s
+        self.raw_longitudinal_velocity = 0.0
+        self.raw_lateral_velocity = 0.0
+        self._body_vx = 0.0
+        self._body_vy = 0.0
+        self.current_beta = 0.0
         self.measured_accel = 0.0
+        self.measured_lateral_accel = 0.0
+        self.raw_longitudinal_accel = 0.0
+        self.raw_lateral_accel = 0.0
+        # 与 Odometry.pose.orientation 一致：child(车体)→parent(map) 旋转；用于世界系加速度→车体
+        self._odom_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
         self.current_x = 0.0
         self.current_y = 0.0
@@ -212,6 +232,7 @@ class CarlaVehicleControl(Node):
         # 滤波系数
         self.filter_alpha_acc = 0.1
         self.filter_alpha_spd = 0.1
+        self.filter_alpha_beta = 0.1
         self.filter_alpha_throttle = 0.1
         self.filter_alpha_brake = 0.6
         self.filter_alpha_x = 0.3  # 位置x滤波系数
@@ -220,7 +241,10 @@ class CarlaVehicleControl(Node):
 
         # 滤波后的实际值
         self.filtered_actual_acc = 0.0  # 滤波后的纵向加速度
-        self.filtered_actual_spd = 0.0  # 滤波后的速度
+        self.filtered_actual_ay = 0.0  # 滤波后的横向加速度
+        self.filtered_actual_spd = 0.0  # 滤波后的纵向速度
+        self.filtered_actual_vy = 0.0  # 滤波后的横向速度
+        self.filtered_actual_beta = 0.0  # 滤波后的侧偏角
         self.filtered_actual_throttle = 0.3  # 滤波后的油门
         self.filtered_actual_brake = 0.0  # 滤波后的刹车
 
@@ -231,7 +255,7 @@ class CarlaVehicleControl(Node):
         self.ekf_R = np.diag([0.5, 0.5, 0.05])  # 观测噪声协方差
         self.ekf_dt = 0.13  # 采样时间 (s)
         self.ekf = None
-        self.last_control_input = np.array([0.0, 0.0])  # 上一次控制输入 [v, delta]
+        self.last_control_input = np.array([0.0, 0.0, 0.0])  # [合速度, beta, delta]
 
         # 油门刹车切换相关参数
         self.switch_threshold = 1.0
@@ -302,11 +326,11 @@ class CarlaVehicleControl(Node):
             self.vehicle_info_callback,
             QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         )
-        self.imu_sub = self.create_subscription(
-            Imu,
-            '/carla/ego_vehicle/imu',
-            self.imu_callback,
-            10
+        self.ego_vehicle_status_sub = self.create_subscription(
+            CarlaEgoVehicleStatus,
+            '/carla/ego_vehicle/vehicle_status',
+            self.ego_vehicle_status_callback,
+            10,
         )
         
         # 发布器
@@ -347,12 +371,6 @@ class CarlaVehicleControl(Node):
             10
         )
 
-        self.qp_xy_path_sub = self.create_subscription(
-            Path,
-            '/path_smoothing/qp_xy_path',
-            self.qp_path_callback,
-            10
-        )
         try:
             from map_load.msg import EgoPlanningTrajectory
             self._EgoPlanningTrajectory = EgoPlanningTrajectory
@@ -403,7 +421,7 @@ class CarlaVehicleControl(Node):
     def _init_carla_connection(self):
         """初始化CARLA连接"""
         try:
-            self.carla_client = carla.Client('192.168.1.6', 2000)
+            self.carla_client = carla.Client('192.168.102.13', 2000)
             self.carla_client.set_timeout(5.0)
             self.carla_world = self.carla_client.get_world()
             self.get_logger().info(f"{GREEN}✓ CARLA连接成功{RESET}")
@@ -476,6 +494,11 @@ class CarlaVehicleControl(Node):
             self._traj_py = []
             self._traj_ptheta = []
             self._traj_stamp_ns = None
+            self._odom_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+            self._body_vx = 0.0
+            self._body_vy = 0.0
+            self.current_beta = 0.0
+            self.filtered_actual_beta = 0.0
         self.speed_controller.reset()
         self.throttle_controller.reset()
         self.brake_controller.reset()
@@ -494,18 +517,52 @@ class CarlaVehicleControl(Node):
         self.get_logger().info(f"移动后航向角: {new_yaw:.2f}°")
         self.get_logger().info(f"{GREEN}✓ 车辆已移动到中心线: ({x:.2f}, {y:.2f}){RESET}")
     
-    def imu_callback(self, msg):
-        """IMU回调 - 获取纵向加速度"""
-        # IMU消息中，linear_acceleration.x 是纵向加速度（车辆前进方向）
-        # CARLA坐标系：x轴向前，y轴向左，z轴向上
-        raw_longitudinal_accel = msg.linear_acceleration.x  # m/s²
+    def ego_vehicle_status_callback(self, msg: CarlaEgoVehicleStatus) -> None:
+        """世界系线加速度 → 车体系纵/横向，供 odom 间隙内积分车体系速度。"""
+        try:
+            aw = np.array(
+                [
+                    float(msg.acceleration.linear.x),
+                    float(msg.acceleration.linear.y),
+                    float(msg.acceleration.linear.z),
+                ],
+                dtype=np.float64,
+            )
+        except (AttributeError, TypeError, ValueError):
+            return
+        with self.data_lock:
+            q = self._odom_quat_xyzw.copy()
+        R_wb = quaternion_matrix([q[0], q[1], q[2], q[3]])[:3, :3]
+        ab = R_wb.T @ aw
+        raw_ax = float(ab[0])
+        raw_ay = float(ab[1])
+        self.raw_longitudinal_accel = raw_ax
+        self.raw_lateral_accel = raw_ay
         if self.enable_noise:
-            noise_accel = np.random.normal(0.0, self.imu_noise_std_accel)
-            longitudinal_accel = raw_longitudinal_accel + noise_accel
+            ax = raw_ax + np.random.normal(0.0, self.imu_noise_std_accel)
+            ay = raw_ay + np.random.normal(0.0, self.imu_noise_std_accel)
         else:
-            longitudinal_accel = raw_longitudinal_accel
-        self.filtered_actual_acc = self.filter_alpha_acc * longitudinal_accel + (1 - self.filter_alpha_acc) * self.filtered_actual_acc
+            ax, ay = raw_ax, raw_ay
+        self.filtered_actual_acc = (
+            self.filter_alpha_acc * ax
+            + (1.0 - self.filter_alpha_acc) * self.filtered_actual_acc
+        )
+        self.filtered_actual_ay = (
+            self.filter_alpha_acc * ay
+            + (1.0 - self.filter_alpha_acc) * self.filtered_actual_ay
+        )
         self.measured_accel = self.filtered_actual_acc
+        self.measured_lateral_accel = self.filtered_actual_ay
+
+    def _refresh_filtered_beta(self) -> float:
+        """由当前车体系速度算 β 并一阶低通，写入 current_beta。"""
+        beta_raw, _ = _body_beta_and_speed_mag(self._body_vx, self._body_vy)
+        self.filtered_actual_beta = (
+            self.filter_alpha_beta * beta_raw
+            + (1.0 - self.filter_alpha_beta) * self.filtered_actual_beta
+        )
+        self.current_beta = self.filtered_actual_beta
+        return self.current_beta
     
     def vehicle_info_callback(self, msg):
         """车辆信息回调 - 获取轴距、最大转向角、车轮等信息"""
@@ -615,25 +672,43 @@ class CarlaVehicleControl(Node):
     def odometry_callback(self, msg):
         """里程计回调 - 使用EKF进行状态估计"""
         with self.data_lock:
-            # 速度来自 twist（child_frame 下通常为车体前向 x、横向 y），用地速模长作 measured_speed
-            tw = msg.twist.twist.linear
-            raw_velocity = math.hypot(tw.x, tw.y)
+            # twist 为车体系：x 纵向、y 横向；纵向仍供速度 PID，合速度+β 供运动学/EKF
+            raw_vx = float(msg.twist.twist.linear.x)
+            raw_vy = float(msg.twist.twist.linear.y)
+            self.raw_longitudinal_velocity = raw_vx
+            self.raw_lateral_velocity = raw_vy
             if self.enable_noise:
-                noise_velocity = np.random.normal(0.0, self.status_noise_std_velocity)
-                spd_meas = raw_velocity + noise_velocity
+                vx_meas = raw_vx + np.random.normal(0.0, self.status_noise_std_velocity)
+                vy_meas = raw_vy + np.random.normal(0.0, self.status_noise_std_velocity)
             else:
-                spd_meas = raw_velocity
+                vx_meas, vy_meas = raw_vx, raw_vy
             self.filtered_actual_spd = (
-                self.filter_alpha_spd * spd_meas
-                + (1 - self.filter_alpha_spd) * self.filtered_actual_spd
+                self.filter_alpha_spd * vx_meas
+                + (1.0 - self.filter_alpha_spd) * self.filtered_actual_spd
             )
+            self.filtered_actual_vy = (
+                self.filter_alpha_spd * vy_meas
+                + (1.0 - self.filter_alpha_spd) * self.filtered_actual_vy
+            )
+            self._body_vx = self.filtered_actual_spd
+            self._body_vy = self.filtered_actual_vy
             self.measured_speed = self.filtered_actual_spd
+            self._refresh_filtered_beta()
             self.is_spd_updated = True
 
             # 获取原始测量值
             raw_x = msg.pose.pose.position.x
             raw_y = msg.pose.pose.position.y
             orientation_q = msg.pose.pose.orientation
+            self._odom_quat_xyzw = np.array(
+                [
+                    float(orientation_q.x),
+                    float(orientation_q.y),
+                    float(orientation_q.z),
+                    float(orientation_q.w),
+                ],
+                dtype=np.float64,
+            )
             _, _, raw_yaw = euler_from_quaternion(
                 [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
             )
@@ -738,22 +813,6 @@ class CarlaVehicleControl(Node):
     def path_boundary_callback(self, msg):
         """PathBoundary 回调：决策无效时置标志，控制循环内会停车"""
         self.path_boundary_valid = msg.valid
-
-    def qp_path_callback(self, msg):
-        """兼容旧 QP Path：仅更新几何折线；清空时间锚定剖面，直至收到 EgoPlanningTrajectory。"""
-        points = []
-        for pose in msg.poses:
-            points.append((pose.pose.position.x, pose.pose.position.y))
-        with self.data_lock:
-            self.qp_path = points
-            if len(points) < 2:
-                self.qp_nearest_idx = 0
-            self._speed_prof_t = []
-            self._speed_prof_v = []
-            self._traj_px = []
-            self._traj_py = []
-            self._traj_ptheta = []
-            self._traj_stamp_ns = None
 
     def ego_plan_traj_callback(self, msg):
         points = []
@@ -894,7 +953,13 @@ class CarlaVehicleControl(Node):
 
         # 重置EKF
         self.ekf = None
-        self.last_control_input = np.array([0.0, 0.0])
+        self.last_control_input = np.array([0.0, 0.0, 0.0])
+        self._body_vx = 0.0
+        self._body_vy = 0.0
+        self.current_beta = 0.0
+        self.filtered_actual_beta = 0.0
+        with self.data_lock:
+            self._odom_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
         # 清空目标点
         self.goal_pose = None
@@ -911,46 +976,7 @@ class CarlaVehicleControl(Node):
         if len(self.waypoints) > 0 and not self.is_controlling:
             self.start_control()
     
-    def compute_curvatures(self, path, window_size=5):
-        """计算路径曲率"""
-        if len(path) < 3:
-            return [0.0 for _ in path]
-        
-        n = len(path)
-        curvatures = []
-        
-        for i in range(n):
-            p_prev = np.array(path[i - 1], dtype=float)
-            p = np.array(path[i], dtype=float)
-            p_next = np.array(path[(i + 1) % n], dtype=float)
-            
-            ab = p - p_prev
-            bc = p_next - p
-            ca = p_prev - p_next
-            
-            lab = np.linalg.norm(ab)
-            lbc = np.linalg.norm(bc)
-            lca = np.linalg.norm(ca)
-            
-            denom = lab * lbc * lca
-            if denom < 1e-6:
-                curvatures.append(0.0)
-                continue
-            
-            area = abs(np.cross(ab, (p_next - p_prev))) * 0.5
-            kappa = 4.0 * area / denom
-
-            # FIXME: 需要根据实际转向角方向判断曲率方向，检查一下这里除了影响前馈还影响哪些内容
-            # 补充曲率方向（左转为负，右转为正，适配转向角方向）
-            # 计算三点的叉积判断转向方向
-            cross = (p[0]-p_prev[0])*(p_next[1]-p_prev[1]) - (p[1]-p_prev[1])*(p_next[0]-p_prev[0])
-            if cross < 0:
-                kappa = -kappa
-            curvatures.append(float(kappa))
-        
-        return curvatures
     
-    # TODO: 后期考虑用交互模型，局部避障规划或speed profile规划速度
     def plan_speed(self):
         """速度规划"""
         planned_speed = 1.5
@@ -1124,19 +1150,30 @@ class CarlaVehicleControl(Node):
                 traj_stamp_ns = self._traj_stamp_ns
 
                 if not self.is_spd_updated:
-                    self.current_speed += self.control_dt * self.measured_accel
+                    self._body_vx += self.control_dt * self.measured_accel
+                    self._body_vy += self.control_dt * self.measured_lateral_accel
                 else:
-                    self.current_speed = self.measured_speed
+                    self._body_vx = self.measured_speed
+                    self._body_vy = self.filtered_actual_vy
                     self.is_spd_updated = False
+                self.current_speed = self._body_vx
+                self._refresh_filtered_beta()
+                _, v_kin = _body_beta_and_speed_mag(self._body_vx, self._body_vy)
 
-                # FIXME: self.ekf.is_updating python成员变量更新方式有待优化
                 if not self.ekf.is_updating and self.is_controlling:
-                    self.current_yaw += float(self.control_dt * self.current_speed * np.tan(self.current_steer) / self.vehicle_wheelbase)
+                    phi = float(self.current_yaw)
+                    beta = float(self.current_beta)
+                    phi_vel = phi + beta
                     self.current_yaw = self.ekf.normalize_angle(self.current_yaw)
-                    self.current_x += self.control_dt * self.current_speed * np.cos(self.current_yaw)
-                    self.current_y += self.control_dt * self.current_speed * np.sin(self.current_yaw)
-                    # 高频更新预测状态
-                    self.ekf.x_hat = np.array([self.current_x, self.current_y, self.current_yaw])
+                    self.current_x += float(
+                        self.control_dt * v_kin * math.cos(phi_vel)
+                    )
+                    self.current_y += float(
+                        self.control_dt * v_kin * math.sin(phi_vel)
+                    )
+                    self.ekf.x_hat = np.array(
+                        [self.current_x, self.current_y, self.current_yaw]
+                    )
                 else:
                     self.current_x = float(self.ekf.x_hat[0])
                     self.current_y = float(self.ekf.x_hat[1])
@@ -1230,9 +1267,9 @@ class CarlaVehicleControl(Node):
             if planned_speed is None:
                 planned_speed = self.plan_speed()
 
-            # 更新EKF控制输入 [v, delta]
-            # delta 是前轮转角，steering_angle 是 Stanley 控制器输出的转向角
-            self.last_control_input = np.array([current_v, steering_angle])
+            # EKF 控制输入 [合速度, beta, delta]
+            v_kin, _ = _body_beta_and_speed_mag(self._body_vx, self._body_vy)
+            self.last_control_input = np.array([v_kin, self.current_beta, steering_angle])
             
             # PID速度控制
             speed_error = planned_speed - current_v
@@ -1314,7 +1351,6 @@ class CarlaVehicleControl(Node):
         self.ref_nearest_idx = 0
         self.qp_nearest_idx = 0
         self.log_counter = 0
-        # self.path_curvatures = self.compute_curvatures(self.waypoints) if len(self.waypoints) >= 3 else []
         self.start_time = self.get_clock().now()
         if not self.is_arrived:
             self.control_timer = self.create_timer(self.control_dt, self.control_loop)

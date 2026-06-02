@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""基于自行车模型的扩展卡尔曼滤波器模块"""
+"""基于质心参考的自行车运动学 EKF"""
 
 import numpy as np
 
@@ -29,30 +29,27 @@ class BicycleModelEKF:
         return normalized
 
     def motion_model(self, x, u):
-        v, delta = u
+        v, beta, delta = u
         phi = x[2]
+        phi_vel = phi + beta
 
-        # 离散运动方程
-        x_new = x[0] + v * np.cos(phi) * self.dt
-        y_new = x[1] + v * np.sin(phi) * self.dt
-        phi_new = phi + (v * np.tan(delta) / self.l) * self.dt
+        x_new = x[0] + v * np.cos(phi_vel) * self.dt
+        y_new = x[1] + v * np.sin(phi_vel) * self.dt
+        phi_new = phi + (v * np.tan(delta) * np.cos(beta) / self.l) * self.dt
 
-        # 角度归一化
         phi_new = self.normalize_angle(phi_new)
 
         return np.array([x_new, y_new, phi_new])
 
     def compute_jacobian_F(self, x, u):
-        v = u[0]
+        v, beta, _delta = u
         phi = x[2]
+        phi_vel = phi + beta
 
-        # 初始化单位矩阵
         F = np.eye(3, dtype=float)
 
-        # 设置非零偏导数
-        F[0, 2] = -v * np.sin(phi) * self.dt
-        F[1, 2] = v * np.cos(phi) * self.dt
-        # F[2, 2] = 1
+        F[0, 2] = -v * np.sin(phi_vel) * self.dt
+        F[1, 2] = v * np.cos(phi_vel) * self.dt
 
         return F
 
@@ -69,7 +66,7 @@ class BicycleModelEKF:
         return self.x_pred, self.P_pred
 
     def update(self, z):
-        
+
         H = np.eye(3, dtype=float)
 
         S = H @ self.P_pred @ H.T + self.R
@@ -78,7 +75,6 @@ class BicycleModelEKF:
 
         y = z - self.x_pred
 
-        # 角度归一化
         y[2] = self.normalize_angle(y[2])
 
         self.x_hat = self.x_pred + K @ y
@@ -92,4 +88,4 @@ class BicycleModelEKF:
 
     def step(self, u, z):
         self.predict(u)
-        return self.update(z)[0]  # 返回更新后的状态
+        return self.update(z)[0]

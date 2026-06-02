@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 速度规划节点(10Hz)
-订阅 LocalPlanningPath、PlanningObstacleArray、adjusted_initialpose、Odometry/Imu（反馈；与链式 init 偏差过大时 DP 采用传感器保底）
+订阅 LocalPlanningPath、PlanningObstacleArray、adjusted_initialpose、Odometry/Imu
 发布 PlanningSpeedProfile、STGraph（stamps_display / stamps_qp / stamps_dp）、nav_msgs/Path（stop_line、dp_st_curve）
 """
 from __future__ import annotations
@@ -16,8 +16,10 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import Imu
 from rclpy.parameter import Parameter
+
+from carla_msgs.msg import CarlaEgoVehicleStatus
+from tf_transformations import quaternion_matrix
 
 try:
     from map_load.msg import (
@@ -40,6 +42,7 @@ except ImportError:
 
 from map_load import math_utils
 from map_load.st_dp_planner import run_dp_speed_plan
+from map_load.st_qp_planner import solve_longitudinal_speed_qp
 
 K_ZERO_VAL = 1e-6
 OBS_STATIC_SPEED_THRESH_MPS = 0.1
@@ -57,6 +60,22 @@ ST_STOP_LINE_S_EPS = 1e-3  # ST 图中将停车线画成极窄 s 区间（t 全�
 # DP 纵向 s：由 st_dp_planner.build_s_vals_dense_sparse 生成（默认 100×0.1m 密 +1m 疏）
 # 连续满足以下任一条件达此帧数后清空停车线缓存并发布空 Path：无新 PlanningObstacleArray；或 obstacles 个数为 0
 STOP_LINE_HOLD_EMPTY_STREAK = 10
+
+
+def _world_linear_accel_to_body_xyz(
+    ax_w: float,
+    ay_w: float,
+    az_w: float,
+    qx: float,
+    qy: float,
+    qz: float,
+    qw: float,
+) -> Tuple[float, float, float]:
+    """世界系线加速度 → 车体系：a_body = R_wb^T @ a_world（R_wb 由 Odometry.pose.orientation，child→parent）。"""
+    R_wb = quaternion_matrix([qx, qy, qz, qw])[:3, :3]
+    aw = np.array([ax_w, ay_w, az_w], dtype=np.float64)
+    ab = R_wb.T @ aw
+    return float(ab[0]), float(ab[1]), float(ab[2])
 
 
 def _intersect_seg_vertical(
@@ -356,24 +375,42 @@ def _append_st_stamps_constant_interval(
     stamp_cls: type,
     obstacle_id: str,
     is_static: bool,
-    s_low: float,
-    s_high: float,
     t_horizon: float,
-    obs_dt: float,
     qp_dt: float,
     dp_dt: float,
+    *,
+    s_low: Optional[float] = None,
+    s_high: Optional[float] = None,
+    obs_dt: Optional[float] = None,
+    coarse: Optional[List[Tuple[float, float, float]]] = None,
 ) -> None:
-    coarse: List[Tuple[float, float, float]] = []
-    ti_max = int(round(t_horizon / obs_dt)) + 1
-    for ti in range(ti_max):
-        t = min(ti * obs_dt, t_horizon)
-        coarse.append((t, s_low, s_high))
+    """
+    写入 display / qp / dp 三套 ST 戳。
+    - coarse 为 None：按 obs_dt 在 [0, t_horizon] 上均匀采样恒定 [s_low, s_high]。
+    - coarse 已给定：用于动态障碍等时变 s 区间（通常已在 obs_dt 上采样）。
+    """
+    if coarse is None:
+        if s_low is None or s_high is None or obs_dt is None:
+            raise ValueError(
+                "_append_st_stamps_constant_interval: coarse=None 时需 s_low、s_high、obs_dt"
+            )
+        coarse_list: List[Tuple[float, float, float]] = []
+        ti_max = int(round(t_horizon / obs_dt)) + 1
+        for ti in range(ti_max):
+            t = min(ti * obs_dt, t_horizon)
+            coarse_list.append((t, float(s_low), float(s_high)))
+        coarse = coarse_list
+    else:
+        coarse = list(coarse)
+
+    coarse.sort(key=lambda x: x[0])
+    for t_c, slo, shi in coarse:
         st = stamp_cls()
         st.obstacle_id = obstacle_id
         st.is_static = is_static
-        st.s_low = float(s_low)
-        st.s_high = float(s_high)
-        st.t = float(t)
+        st.s_low = float(slo)
+        st.s_high = float(shi)
+        st.t = float(t_c)
         stamps_display.append(st)
     for t_f, slo, shi in _interpolate_s_interval_stamps(coarse, qp_dt, t_horizon):
         stq = stamp_cls()
@@ -424,9 +461,14 @@ class SpeedPlannerNode(Node):
         # 上一帧成功规划并发布到 PlanningSpeedProfile 后，在 t=EGO_SPEED_DT 处的 v、a，供本帧 run_dp 的 init_v/init_a
         self._next_dp_init_v: Optional[float] = None
         self._next_dp_init_a: Optional[float] = None
+        # 上一周期成功 DP 的 (s_end-s_start)/(t_end-t_start)，供本帧 DP 速度代价；冷启动或不可算时为 None，run_dp 内退化为 v_cruise
+        self._dp_v_avg_ref: Optional[float] = None
         # 传感器反馈（与链式 init 比对，超差则保底）
         self._ego_speed_mps: Optional[float] = None
         self._ego_accel_mps2: Optional[float] = None
+        self._ego_accel_mps3: Optional[float] = None
+        # 与 /carla/ego_vehicle/odometry pose.orientation 同步（车体→map）
+        self._ego_odom_q_xyzw: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
 
         self.create_subscription(PoseStamped, "/adjusted_initialpose", self._on_adjusted_initialpose, 10)
         self.create_subscription(LocalPlanningPath, "/planning/local_planning_path", self._on_local_path, 10)
@@ -440,7 +482,12 @@ class SpeedPlannerNode(Node):
         self._pub_dp_st = self.create_publisher(Path, "/planning/dp_st_curve", 10)
 
         self.create_subscription(Odometry, "/carla/ego_vehicle/odometry", self._on_odometry, 10)
-        self.create_subscription(Imu, "/carla/ego_vehicle/imu", self._on_imu, 10)
+        self.create_subscription(
+            CarlaEgoVehicleStatus,
+            "/carla/ego_vehicle/vehicle_status",
+            self._on_ego_vehicle_status,
+            10,
+        )
 
         self.create_timer(0.1, self._on_timer)
         self.get_logger().info("speed_planner started (10Hz ST + default speed profile)")
@@ -453,38 +500,44 @@ class SpeedPlannerNode(Node):
         self._pob_callback_since_timer = True
 
     def _on_odometry(self, msg: Odometry) -> None:
-        """map 系线速度模长，用于与链式 init_v 比对（无滤波）。"""
+        """map 系线速度；姿态四元数用于将 vehicle_status 世界系加速度旋到车体。"""
+        try:
+            q = msg.pose.pose.orientation
+            self._ego_odom_q_xyzw = (
+                float(q.x),
+                float(q.y),
+                float(q.z),
+                float(q.w),
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
         try:
             vx = float(msg.twist.twist.linear.x)
-            vy = float(msg.twist.twist.linear.y)
+            # vy = float(msg.twist.twist.linear.y)
         except (AttributeError, TypeError, ValueError):
             return
-        self._ego_speed_mps = float(math.hypot(vx, vy))
+        self._ego_speed_mps = vx
 
-    def _on_imu(self, msg: Imu) -> None:
-        """车体纵向加速度，用于与链式 init_a 比对（无滤波）。"""
+    def _on_ego_vehicle_status(self, msg: CarlaEgoVehicleStatus) -> None:
+        """vehicle_status 线加速度视为世界系，用最近一帧 odom 四元数旋到车体纵/横向。"""
         try:
-            self._ego_accel_mps2 = float(msg.linear_acceleration.x)
+            ax_w = float(msg.acceleration.linear.x)
+            ay_w = float(msg.acceleration.linear.y)
+            az_w = float(msg.acceleration.linear.z)
         except (AttributeError, TypeError, ValueError):
             return
+        qx, qy, qz, qw = self._ego_odom_q_xyzw
+        ax_b, ay_b, _az_b = _world_linear_accel_to_body_xyz(ax_w, ay_w, az_w, qx, qy, qz, qw)
+        self._ego_accel_mps2 = ax_b
+        self._ego_accel_mps3 = ay_b
 
-    def _dp_init_with_sensor_fallback(self) -> Tuple[float, float]:
+    def _dp_init(self) -> Tuple[float, float]:
         """
         默认用上一帧规划在 EGO_SPEED_DT 处的 v、a；若与当前传感器差超过阈值则改用传感器（无传感器则仅用链式值）。
         """
         v_plan = 0.0 if self._next_dp_init_v is None else max(0.0, float(self._next_dp_init_v))
         a_plan = 0.0 if self._next_dp_init_a is None else float(self._next_dp_init_a)
-        v_out = v_plan
-        if self._ego_speed_mps is not None:
-            v_s = max(0.0, float(self._ego_speed_mps))
-            if abs(v_plan - v_s) > self.sensor_threshold_dv:
-                v_out = v_s
-        a_out = a_plan
-        if self._ego_accel_mps2 is not None:
-            a_s = float(self._ego_accel_mps2)
-            if abs(a_plan - a_s) > self.sensor_threshold_da:
-                a_out = a_s
-        return v_out, a_out
+        return v_plan, a_plan
 
     def _on_adjusted_initialpose(self, _msg: PoseStamped) -> None:
         self._local_path = None
@@ -496,8 +549,11 @@ class SpeedPlannerNode(Node):
         self._cold_start_after_adjust = True
         self._next_dp_init_v = None
         self._next_dp_init_a = None
+        self._dp_v_avg_ref = None
         self._ego_speed_mps = None
         self._ego_accel_mps2 = None
+        self._ego_accel_mps3 = None
+        self._ego_odom_q_xyzw = (0.0, 0.0, 0.0, 1.0)
         empty = Path()
         empty.header.stamp = self.get_clock().now().to_msg()
         empty.header.frame_id = "map"
@@ -653,6 +709,29 @@ class SpeedPlannerNode(Node):
             msg.points.append(p)
         return msg
 
+    def _speed_profile_from_qp_nodes(
+        self,
+        t_qp: Sequence[float],
+        s_qp: Sequence[float],
+        v_qp: Sequence[float],
+        a_qp: Sequence[float],
+    ) -> PlanningSpeedProfile:
+        """由 QP 结点 (s,v,a) 直接构建剖面，与 EGO_SPEED_DT / EGO_SPEED_T 网格一致。"""
+        msg = PlanningSpeedProfile()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        n_out = int(round(EGO_SPEED_T / EGO_SPEED_DT)) + 1
+        n = min(len(t_qp), len(s_qp), len(v_qp), len(a_qp), n_out)
+        for i in range(n):
+            p = PlanningSpeedPoint()
+            p.t = float(min(t_qp[i], EGO_SPEED_T))
+            p.s = float(s_qp[i])
+            p.v = float(max(0.0, v_qp[i]))
+            p.a = float(a_qp[i])
+            p.da = 0.0
+            msg.points.append(p)
+        return msg
+
     def _default_speed_profile(self) -> PlanningSpeedProfile:
         msg = PlanningSpeedProfile()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -703,6 +782,14 @@ class SpeedPlannerNode(Node):
 
         ref_xy = np.array([[p.x, p.y] for p in lp.points], dtype=float)
         acc_s = np.array([float(p.s) for p in lp.points], dtype=float)
+        kappa_abs_lp = np.abs(
+            np.asarray(
+                math_utils.compute_path_curvatures_triangle(
+                    [(float(p.x), float(p.y)) for p in lp.points]
+                ),
+                dtype=float,
+            )
+        )
         lw = float(self.get_parameter("ego_half_width").value)
         lat_buf = float(self.get_parameter("ego_lat_buffer").value)
         half_corridor = lw + lat_buf
@@ -814,35 +901,18 @@ class SpeedPlannerNode(Node):
         # 三套dt：一套用于显示动态obs不可行区域，一套用于DP，一套用于QP
         if STObstacleStamp is not None:
             for oid_key, coarse in sorted(dynamic_coarse.items(), key=lambda kv: kv[0]):
-                coarse.sort(key=lambda x: x[0])
-                for t_c, slo, shi in coarse:
-                    m = STObstacleStamp()
-                    m.obstacle_id = oid_key
-                    m.is_static = False
-                    m.s_low = float(slo)
-                    m.s_high = float(shi)
-                    m.t = float(t_c)
-                    stamps_display.append(m)
-                for t_f, slo_i, shi_i in _interpolate_s_interval_stamps(
-                    coarse, EGO_SPEED_DT, ST_T_HORIZON
-                ):
-                    mq = STObstacleStamp()
-                    mq.obstacle_id = oid_key
-                    mq.is_static = False
-                    mq.s_low = float(slo_i)
-                    mq.s_high = float(shi_i)
-                    mq.t = float(t_f)
-                    stamps_qp.append(mq)
-                for t_f, slo_i, shi_i in _interpolate_s_interval_stamps(
-                    coarse, DP_ST_GRAPH_DT, ST_T_HORIZON
-                ):
-                    md = STObstacleStamp()
-                    md.obstacle_id = oid_key
-                    md.is_static = False
-                    md.s_low = float(slo_i)
-                    md.s_high = float(shi_i)
-                    md.t = float(t_f)
-                    stamps_dp.append(md)
+                _append_st_stamps_constant_interval(
+                    stamps_display,
+                    stamps_qp,
+                    stamps_dp,
+                    STObstacleStamp,
+                    oid_key,
+                    False,
+                    ST_T_HORIZON,
+                    EGO_SPEED_DT,
+                    DP_ST_GRAPH_DT,
+                    coarse=coarse,
+                )
 
         cold_fallback_used = False
         if (
@@ -875,12 +945,12 @@ class SpeedPlannerNode(Node):
                 STObstacleStamp,
                 "stop_line",
                 True,
-                slo,
-                shi,
                 ST_T_HORIZON,
-                OBS_SAMPLE_DT,
                 EGO_SPEED_DT,
                 DP_ST_GRAPH_DT,
+                s_low=slo,
+                s_high=shi,
+                obs_dt=OBS_SAMPLE_DT,
             )
 
         def _publish_stop_line_at_s(s_raw: float) -> None:
@@ -928,16 +998,18 @@ class SpeedPlannerNode(Node):
         self._pub_st.publish(st)
 
         s_max_dp = float(min(s1, float(acc_s[-1])))
-        init_v, init_a = self._dp_init_with_sensor_fallback()
+        s_cap_dp = max(s_max_dp, 0.5)
+        init_v, init_a = self._dp_init()
         dp_result = run_dp_speed_plan(
             stamps_dp,
             t_horizon=ST_T_HORIZON,
             dt=DP_ST_GRAPH_DT,
-            s_max=max(s_max_dp, 0.5),
+            s_max=s_cap_dp,
             ds=None,
             v_cruise=DEFAULT_V,
             init_v=init_v,
             init_a=init_a,
+            v_avg_ref=self._dp_v_avg_ref,
         )
         dp_path = Path()
         dp_path.header.stamp = stamp
@@ -963,10 +1035,41 @@ class SpeedPlannerNode(Node):
                 ps.pose.position.z = 0.0
                 ps.pose.orientation.w = 1.0
                 dp_path.poses.append(ps)
-            sp = self._speed_profile_from_dp_resampled(dp_result.t, dp_result.s, init_v, init_a)
+            tdp = dp_result.t
+            sdp = dp_result.s
+            if len(tdp) >= 2 and len(sdp) >= 2 and len(tdp) == len(sdp):
+                dtm = float(tdp[-1]) - float(tdp[0])
+                if dtm > 1e-9:
+                    v_av = (float(sdp[-1]) - float(sdp[0])) / dtm
+                    self._dp_v_avg_ref = float(v_av) if math.isfinite(v_av) else None
+                else:
+                    self._dp_v_avg_ref = None
+            else:
+                self._dp_v_avg_ref = None
+            qp_sol = solve_longitudinal_speed_qp(
+                stamps_qp,
+                np.asarray(dp_result.t, dtype=float),
+                np.asarray(dp_result.s, dtype=float),
+                acc_s,
+                kappa_abs_lp,
+                EGO_SPEED_DT,
+                ST_T_HORIZON,
+                DEFAULT_V,
+                s_cap_dp,
+                0.0,
+                init_v,
+                init_a,
+            )
+            if qp_sol is not None:
+                t_qp, s_qp, v_qp, a_qp = qp_sol
+                sp = self._speed_profile_from_qp_nodes(t_qp, s_qp, v_qp, a_qp)
+            else:
+                self.get_logger().error("❌❌❌ QP 求解失败，使用 DP 结果 ❌❌❌")
+                sp = self._speed_profile_from_dp_resampled(dp_result.t, dp_result.s, init_v, init_a)
             if len(sp.points) >= 2:
                 self._next_dp_init_v = float(max(0.0, sp.points[1].v))
                 self._next_dp_init_a = float(sp.points[1].a)
+                # self.get_logger().info(f"✅ kappa: {kappa_abs_lp[0]:.2f}")
             else:
                 self._next_dp_init_v = None
                 self._next_dp_init_a = None

@@ -23,13 +23,15 @@ def _edge_cost_velocity_dp(
     w_exceed: float,
     w_lower_speed: float,
     w_ref: float,
+    w_avg: float,
+    v_avg_ref: float,
     inf: float,
 ) -> float:
     if v < 0.0:
         return inf
     denom = max(float(v_max_prune), 1e-9)
     v_det = (v - float(v_max_prune)) / denom
-    ref_line = float(w_ref) * abs(v - float(v_ref))
+    ref_line = float(w_ref) * abs(v - float(v_ref)) + float(w_avg) * abs(v - float(v_avg_ref))
     if v_det > 0.0:
         return float(w_exceed) * v_det + ref_line
     return -float(w_lower_speed) * v_det + ref_line
@@ -315,19 +317,21 @@ def run_dp_speed_plan(
     w_exceed: float = 20.0,
     w_lower_speed: float = 0.0,
     w_ref: float = 0.7,
-    w_acc: float = 0.85,
+    w_acc: float = 0.5,
     w_dacc: float = 0.25,
-    w_jerk: float = 0.5,
+    w_jerk: float = 0.1,
     w_soft_obs: float = 1.0,
     d0_soft_m: float = 1.5,
     max_accel: float = 2.0,
     a_cost_min: float = -4.0,
     a_cost_max: float = 2.0,
     v_max_prune: float = 10.0,
-    w_progress: float = 0.05,
+    w_progress: float = 0.35,
     dense_s_points: int = 100,
     dense_ds: float = 0.1,
     sparse_ds: float = 1.0,
+    w_avg: float = 0.0,
+    v_avg_ref: Optional[float] = None,
 ) -> Optional[DPSpeedPlanResult]:
     if dt <= 0 or s_max <= 0:
         return None
@@ -352,6 +356,11 @@ def run_dp_speed_plan(
     nt = len(ts)
     if nt < 2:
         return None
+
+    if v_avg_ref is None or not math.isfinite(float(v_avg_ref)):
+        v_avg_effective = float(v_cruise)
+    else:
+        v_avg_effective = float(v_avg_ref)
 
     if ds is not None:
         s_vals = np.arange(0.0, s_max + 0.5 * ds, ds, dtype=float)
@@ -424,6 +433,8 @@ def run_dp_speed_plan(
                     w_exceed,
                     w_lower_speed,
                     w_ref,
+                    w_avg,
+                    v_avg_effective,
                     inf,
                 )
                 c_a = _edge_cost_acceleration_dp(
@@ -455,7 +466,6 @@ def run_dp_speed_plan(
                     cost[k - 1, i]
                     + c_edge
                     + jerk_cost
-                    # - w_progress * (sj - si)
                     + w_progress * (s_max - sj)/s_max
                     + soft_arrival
                 )

@@ -17,46 +17,56 @@ See REAL_TIME_FACTOR_CHANGES.md and updated_version.txt(version 2.3)
 ![Real-time_visuals_of_Rviz_and_Carla](pic/Real-time_visuals_of_Rviz_and_Carla.png "Real-time visuals of Rviz and Carla")  
 
 ---
+# Quick start
 
-# In terminal with ros2
+## In vehicle_ctrl/vehicle_ctrl/carla_vehicle_control.py
+```python
+def _init_carla_connection(self):
+    # Subsititude your own IP Address here
+    self.carla_client = carla.Client('Localhost', 2000) # Not limited to local
+    self.carla_client.set_timeout(5.0)
+    self.carla_world = self.carla_client.get_world()
+```
+
+## In terminal with ros2
 ```bash
 export ROS_DOMAIN_ID=200
 ```
 
-# Terminal 1, open carla simulator
+## Terminal 1, open carla simulator
 ```bash
 cd carla0914/
 ./CarlaUE4.sh 
 ```
 
-# Terminal 2, load carla-ros-bridge
+## Terminal 2, load carla-ros-bridge
 ```bash
 source ~/carla-ros-bridge/catkin_ws/install/setup.bash
 ros2 launch carla_ros_bridge carla_ros_bridge.launch.py synchronous_mode:=True town:=Town01
 ```
 
-# Terminal 3, generate a car
+## Terminal 3, generate a car
 ```bash
 source ~/carla-ros-bridge/catkin_ws/install/setup.bash
 ```
-## Config of carla is modifiable in _objects.json_
+### Config of carla is modifiable in _objects.json_
 ```bash
 ros2 launch carla_spawn_objects carla_example_ego_vehicle.launch.py spawn_sensors_only:=False objects_definition_file:=/home/usr/ws/src/vehicle_ctrl/config/objects.json 
 ```
 
-# Terminal 4, load map
+## Terminal 4, load map
 ```bash
 source ~/ws/install/setup.bash 
 ros2 run map_load map_control_node 
 ```
 
-# Terminal 5, remap goal
+## Terminal 5, remap goal
 ```bash
 source ~/ws/install/setup.bash 
 ros2 run vehicle_ctrl remap_goal
 ```
 
-# Terminal 6, open rviz
+## Terminal 6, open rviz
 ```bash
 rviz2 -d src/vehicle_ctrl/rviz2/carla_map_spawn_anywherev2.rviz 
 ```
@@ -76,20 +86,20 @@ rviz2 -d src/vehicle_ctrl/rviz2/carla_map_spawn_anywherev2.rviz
 }
 ```
 
-# Terminal 7, open control/smooth/perception node
+## Terminal 7, open control/smooth/perception node
 ```bash
 source ~/ws/install/setup.bash 
 source ~/carla-ros-bridge/catkin_ws/install/setup.bash
 ros2 launch vehicle_ctrl full_system.launch.py
 ```
 
-# Terminal 8, open the plotter
+## Terminal 8, open the plotter
 ```bash
 source ~/ws/install/setup.bash 
 ros2 run vehicle_ctrl vehicle_plotter
 ```
 
-# Terminal 9, run scenario
+## Terminal 9, run scenario
 ```python
 # In following_scenario.py
 # Subsititude your own carla_simulator path here
