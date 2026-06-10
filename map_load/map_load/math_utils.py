@@ -7,8 +7,44 @@
 2. Cartesian 坐标系到 Frenet 坐标系转换
 """
 
+import math
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Sequence, Tuple, List, Optional
+
+
+def interpolate_angle(a0: float, a1: float, r: float) -> float:
+    """两角度圆插值，r∈[0,1]；结果在 (-π, π]。"""
+    r = float(np.clip(r, 0.0, 1.0))
+    x = (1.0 - r) * math.cos(a0) + r * math.cos(a1)
+    y = (1.0 - r) * math.sin(a0) + r * math.sin(a1)
+    return math.atan2(y, x)
+
+
+def interp_angle_1d(
+    x_query: float,
+    x: Sequence[float],
+    angles: Sequence[float],
+) -> float:
+    """沿自变量 x 对角度序列做圆插值（等价于分段圆插值版 np.interp）。"""
+    x_arr = np.asarray(x, dtype=np.float64)
+    a_arr = np.asarray(angles, dtype=np.float64)
+    if x_arr.size == 0:
+        return 0.0
+    if x_arr.size == 1:
+        return float(a_arr[0])
+    xq = float(x_query)
+    if xq <= float(x_arr[0]):
+        return float(a_arr[0])
+    if xq >= float(x_arr[-1]):
+        return float(a_arr[-1])
+    idx = int(np.searchsorted(x_arr, xq, side="right") - 1)
+    idx = max(0, min(idx, x_arr.size - 2))
+    x0, x1 = float(x_arr[idx]), float(x_arr[idx + 1])
+    a0, a1 = float(a_arr[idx]), float(a_arr[idx + 1])
+    if abs(x1 - x0) < 1e-12:
+        return a0
+    r = (xq - x0) / (x1 - x0)
+    return interpolate_angle(a0, a1, r)
 
 
 def compute_path_profile(xy_points: np.ndarray, point_spacing: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

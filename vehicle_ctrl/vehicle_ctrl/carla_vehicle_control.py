@@ -25,7 +25,7 @@ try:
 except ImportError:
     PathBoundary = None
 
-from .stanley_controller import StanleyController
+from .cg_lqr_controller import CgLqrController
 from .pid_controller import PIDController
 from .bicycle_model_ekf import BicycleModelEKF
 from .constants import GREEN, CYAN, RESET
@@ -44,14 +44,16 @@ def _body_beta_and_speed_mag(vx: float, vy: float) -> tuple[float, float]:
 
 def _default_carla_control_params():
     return {
-        'stanley': {
-            'k': 6,
-            'epsilon': 0.3,
+        'lqr': {
+            'q_x': 100.0,
+            'q_y': 100.0,
+            'q_theta': 10.0,
+            'r_v': 1.0,
+            'r_delta': 50.0,
             'max_steer': 1.22,
-            'filter_alpha': 0.2,
-            'lookahead_base': 1.5,
-            'lookahead_gain': 0.5,
-            'curvature_feedforward_gain': 0.0,
+            'lr_ratio': 0.5,
+            'v_r_floor': 0.15,
+            'curvature_dt': 0.05,
         },
         'speed_controller': {
             'kp': 2.0,
@@ -161,18 +163,25 @@ class CarlaVehicleControl(Node):
         self.max_acceleration = 2.0
         self.max_deceleration = -3.0
         self.dead_zone_throttle = 0.1
+        self.vehicle_wheelbase = 2.7  # m
+        self.vehicle_max_steer_angle = 1.22  # rad
 
         ctrl_cfg = _load_carla_control_params(self.get_logger())
-        st = ctrl_cfg['stanley']
-        # Stanley：k 过小则横向误差对转角影响小，过大则易震荡（参数见 config/carla_control_params.json）
-        self.stanley = StanleyController(
-            k=st['k'],
-            epsilon=st['epsilon'],
-            max_steer=st['max_steer'],
-            filter_alpha=st['filter_alpha'],
-            lookahead_base=st['lookahead_base'],
-            lookahead_gain=st['lookahead_gain'],
-            curvature_feedforward_gain=st['curvature_feedforward_gain'],
+        lqr_cfg = ctrl_cfg['lqr']
+        self.lqr = CgLqrController(
+            wheelbase=self.vehicle_wheelbase,
+            dt=self.control_dt,
+            lr_ratio=float(lqr_cfg['lr_ratio']),
+            max_steer=float(lqr_cfg['max_steer']),
+            max_speed=self.max_speed,
+            max_acceleration=self.max_acceleration,
+            q_x=float(lqr_cfg['q_x']),
+            q_y=float(lqr_cfg['q_y']),
+            q_theta=float(lqr_cfg['q_theta']),
+            r_v=float(lqr_cfg['r_v']),
+            r_delta=float(lqr_cfg['r_delta']),
+            v_r_floor=float(lqr_cfg['v_r_floor']),
+            curvature_dt=float(lqr_cfg['curvature_dt']),
         )
 
         self.speed_controller = PIDController(**_pid_from_section(ctrl_cfg['speed_controller'], self.control_dt))
@@ -181,9 +190,6 @@ class CarlaVehicleControl(Node):
         self.brake_controller = PIDController(**_pid_from_section(ctrl_cfg['brake_controller'], self.control_dt))
         
         # 车辆物理属性（从vehicle_info获取，如果无法获取则使用默认值）
-        # CARLA官方默认值：轴距约2.7m，最大转向角约70度(1.22 rad)
-        self.vehicle_wheelbase = 2.7  # m (轴距，默认值)
-        self.vehicle_max_steer_angle = 1.22  # rad (最大转向角，默认值约70度)
         self.vehicle_wheel_count = 4  # 默认4轮
         self.vehicle_wheel_info = []  # 存储车轮信息
         self.vehicle_type_id = ""
@@ -503,9 +509,6 @@ class CarlaVehicleControl(Node):
         self.throttle_controller.reset()
         self.brake_controller.reset()
         self.is_arrived = False
-        self.stanley.filtered_cross_track_error = 0.0
-        self.stanley.filtered_heading_error = 0.0
-        
         # 验证移动是否成功
         new_loc = self.ego_vehicle.get_location()
         new_transform = self.ego_vehicle.get_transform()
@@ -624,7 +627,11 @@ class CarlaVehicleControl(Node):
                 return
             
             self.vehicle_info_received = True
-            
+            self.lqr.update_vehicle_params(
+                wheelbase=self.vehicle_wheelbase,
+                max_steer=self.vehicle_max_steer_angle,
+            )
+
             # 打印车辆信息
             self.get_logger().info(
                 f"{GREEN}=== 车辆信息已获取 ==={RESET}\n"
@@ -654,6 +661,10 @@ class CarlaVehicleControl(Node):
         self.vehicle_max_steer_angle = 1.22
         self.vehicle_wheel_count = 4
         self.vehicle_info_received = True
+        self.lqr.update_vehicle_params(
+            wheelbase=self.vehicle_wheelbase,
+            max_steer=self.vehicle_max_steer_angle,
+        )
 
     def initialize_ekf(self, x, y, yaw):
         """初始化EKF"""
@@ -947,10 +958,6 @@ class CarlaVehicleControl(Node):
         self.brake_controller.reset()
         self.log_counter = 0
         
-        # 重置Stanley控制器滤波状态
-        self.stanley.filtered_cross_track_error = 0.0
-        self.stanley.filtered_heading_error = 0.0
-
         # 重置EKF
         self.ekf = None
         self.last_control_input = np.array([0.0, 0.0, 0.0])
@@ -1094,7 +1101,18 @@ class CarlaVehicleControl(Node):
         # 发布参考线
         self.reference_path_pub.publish(path_msg)
     
-    def _update_error_visualization(self, cross_track_error, heading_error, normalized_steer=0.0, vehicle_speed=0.0, vehicle_accel=0.0, throttle=0.0, brake=0.0, speed_error=0.0, accel_error=0.0):
+    def _update_error_visualization(
+        self,
+        cross_track_error,
+        heading_error,
+        normalized_steer=0.0,
+        vehicle_speed=0.0,
+        vehicle_accel=0.0,
+        throttle=0.0,
+        brake=0.0,
+        speed_error=0.0,
+        accel_error=0.0,
+    ):
         """发布绘图数据到话题"""
         if not self.enable_plotting:
             return
@@ -1222,26 +1240,22 @@ class CarlaVehicleControl(Node):
                 qp_path, current_x, current_y, self.qp_nearest_idx
             )
 
-            (
-                steering_angle,
-                target_point,
-                heading_error,
-                cross_track_error,
-                curvature,
-                _seg_idx,
-            ) = self.stanley.compute_steering_time_anchor(
+            lqr_out = self.lqr.compute_control(
                 current_x,
                 current_y,
                 current_yaw,
-                current_v,
                 speed_prof_t,
                 traj_px,
                 traj_py,
                 traj_ptheta,
+                speed_prof_v,
                 tau_plan,
-                fallback_path=qp_path,
-                fallback_start_idx=self.qp_nearest_idx,
             )
+            steering_angle = lqr_out["steering_angle"]
+            target_point = lqr_out["ref_point"]
+            ref_theta = lqr_out["ref_theta"]
+            heading_error = lqr_out["heading_error"]
+            cross_track_error = lqr_out["cross_track_error"]
 
             new_ref_idx = self._find_nearest_idx_on_path(
                 waypoints, current_x, current_y, self.ref_nearest_idx
@@ -1260,17 +1274,13 @@ class CarlaVehicleControl(Node):
                 self.publish_reference_path(waypoints, self.ref_nearest_idx, current_v)
                 self.reference_path_counter = 0
 
-            # 速度：优先按上一帧起保持的 SpeedProfile (t,v) 相对轨迹 header 时间插值；无剖面时回退 plan_speed
-            planned_speed = self._planned_speed_from_held_profile(
-                speed_prof_t, speed_prof_v, traj_stamp_ns, tau_clamped=tau_plan
-            )
-            if planned_speed is None:
-                planned_speed = self.plan_speed()
+            # 速度：LQR 方案 A — v_r 来自轨迹插值，v_cmd = v_r + Δv 作为 PID 期望速度
+            planned_speed = lqr_out["v_cmd"]
 
             # EKF 控制输入 [合速度, beta, delta]
             v_kin, _ = _body_beta_and_speed_mag(self._body_vx, self._body_vy)
             self.last_control_input = np.array([v_kin, self.current_beta, steering_angle])
-            
+
             # PID速度控制
             speed_error = planned_speed - current_v
             acceleration = self.speed_controller.compute(speed_error)
@@ -1297,13 +1307,11 @@ class CarlaVehicleControl(Node):
 
             # 发布控制命令
             # steering_angle 是弧度，CARLA steer 范围是 [-1, 1]
-            # 假设最大转向角约为 70 度 (1.22 rad)
-            max_steer_rad = 1.22  # CARLA 车辆最大转向角
+            max_steer_rad = self.vehicle_max_steer_angle
             normalized_steer = steering_angle / max_steer_rad
-            
+
             # CARLA转向方向：正值=右转，负值=左转
-            # Stanley输出：正值=左转，负值=右转（标准右手坐标系）
-            # 需要取反
+            # LQR 输出：正值=左转，负值=右转（标准右手坐标系），需取反
             normalized_steer = -normalized_steer
 
             # 更新误差可视化（绘图）

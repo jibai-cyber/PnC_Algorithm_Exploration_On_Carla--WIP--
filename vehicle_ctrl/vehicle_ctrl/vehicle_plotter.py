@@ -64,7 +64,7 @@ class VehiclePlotter(Node):
         self.brake_history = deque(maxlen=self.error_history_size)
         self.speed_error_history = deque(maxlen=self.error_history_size)
         self.accel_error_history = deque(maxlen=self.error_history_size)
-        
+
         # Frenet坐标数据存储（只保存当前点，不保存历史）
         self.current_frenet_s = None
         self.current_frenet_l = None

@@ -890,7 +890,7 @@ class VehiclePerception(Node):
                 r = (s_query - p0.s) / ds
                 x = p0.x + r * (p1.x - p0.x)
                 y = p0.y + r * (p1.y - p0.y)
-                th = p0.theta + r * (p1.theta - p0.theta)
+                th = math_utils.interpolate_angle(p0.theta, p1.theta, r)
                 return float(x), float(y), float(th)
         p = path_pts[-1]
         return p.x, p.y, p.theta

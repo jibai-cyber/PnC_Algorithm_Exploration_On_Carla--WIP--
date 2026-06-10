@@ -13,6 +13,7 @@ See REAL_TIME_FACTOR_CHANGES.md and updated_version.txt(version 2.3)
 
 # Current effect
 https://github.com/user-attachments/assets/95dcb773-babf-4f57-a353-a40c0356a24b  
+
 | ![Debug_Diagram](pic/Debug_Diagram.png "Debug Diagram")  | 
 |:--:| 
 | *Debug Diagram* |  
@@ -104,7 +105,7 @@ ros2 run vehicle_ctrl vehicle_plotter
 
 ## Terminal 9, run scenario
 ```python
-# In following_scenario.py
+# In python files of scenario_set
 # Subsititude your own carla_simulator path here
 sys.path.append(glob.glob('/home/D/carla_simulator/PythonAPI/carla/dist/carla-*%d.%d-%s.egg' % (
     sys.version_info.major,
@@ -112,5 +113,5 @@ sys.path.append(glob.glob('/home/D/carla_simulator/PythonAPI/carla/dist/carla-*%
     'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
 ```
 ```bash
-cd ~/ws/src/scenario_set && python3.10 following_scenario.py --host localhost --filterv 'vehicle.audi.*' --ahead-distance 5.0 --travel-distance 200.0 --position-jump-threshold 20.0
+cd ~/ws/src/scenario_set && python3.10 cutin_scenario.py --host localhost --port 2000 --tm-port 8002 --filterv 'vehicle.audi.*' --side-distance 4.0 --behind-distance 10.0 --cutin-distance 25.0 --cruise-distance 20.0 --right-side --position-jump-threshold 5.0'
 ```

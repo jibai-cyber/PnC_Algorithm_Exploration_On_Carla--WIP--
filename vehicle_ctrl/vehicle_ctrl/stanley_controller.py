@@ -4,6 +4,8 @@
 import math
 import numpy as np
 
+from map_load.math_utils import interp_angle_1d
+
 
 class StanleyController:
     def __init__(self, k=3.5, epsilon=0.3, max_steer=1.22, 
@@ -168,12 +170,10 @@ class StanleyController:
         x_arr = np.asarray(traj_x, dtype=np.float64)
         y_arr = np.asarray(traj_y, dtype=np.float64)
         th_arr = np.asarray(traj_theta, dtype=np.float64)
-        if np.nanmax(th_arr) - np.nanmin(th_arr) > math.pi:
-            th_arr = np.unwrap(th_arr)
 
         xr = float(np.interp(tau, t_arr, x_arr))
         yr = float(np.interp(tau, t_arr, y_arr))
-        thr = float(np.interp(tau, t_arr, th_arr))
+        thr = interp_angle_1d(tau, t_arr, th_arr)
 
         dx = xr - current_x
         dy = yr - current_y

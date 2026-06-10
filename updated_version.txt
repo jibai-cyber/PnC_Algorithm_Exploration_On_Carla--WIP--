@@ -422,3 +422,47 @@ TODO:
 
 3. 考虑从 CILQR, AL-LQR, RL等思路设计或优化规划器，
    使其在多车道决策或复杂的混行场景能有更好的表现
+
+
+---
+version 2.6
+
+1. 追踪性能优化：横向控制由 Stanley 替换为 LQR
+
+   - 以几何中心为参考点的自行车运动学模型，在参考轨迹附近线性化后每控制周期重算 A、B 并求解离散 LQR；
+     输出前馈转向角 δ_r(κ) 与反馈修正 Δδ，以及速度修正 Δv
+
+   - 横向控制不再调用 Stanley，如需参考可回退为version 2.5；纵向仍保留 speed -> accel -> 油门/刹车 PID 链，
+     LQR 的 v_cmd 作为速度 PID 期望。配置项由 stanley 段改为 lqr 段（见
+     config/carla_control_params.json）
+
+   - 公式与推导见 `vehicle_ctrl/docs/cg_lqr_controller.md`
+
+   为何 LQR 在大曲率弯道（尤其 U-turn）追踪优于 Stanley（原理简述）：
+
+   - Stanley 律为 δ = θ_e + atan(k·e / (v+ε))，本质是纯误差反馈，无曲率前馈
+     （此前 curvature_feedforward_gain=0）。大曲率弯所需转角 δ_need ≈ atan(L·κ) 往往接近
+     物理上限；在 v 不低时 atan 项增益被分母压缩，叠加 k 取值保守，容易出现
+     “前轮转角未打满”——车辆几何上转不过弯，横向误差在弯心段累积，U-turn 处表现为
+     小范围但偏移量偏大
+
+   - LQR 将控制量拆为 δ = δ_r(κ_r) + Δδ：δ_r 由参考轨迹曲率经质心运动学反算，
+     弯心段可直接给出接近 δ_max 的前馈转角；Δδ 由 [e_x, e_y, e_θ] 联合状态反馈，
+     并通过 Q 矩阵同时惩罚位置与航向偏差。曲率大时 B 矩阵中 δ 对航向/位置的耦合增强，
+     反馈与前馈协同，比 Stanley 单通道 atan 律更易在物理转向极限内“转满、拉回”
+
+   - 与 EKF 一致采用质心模型，状态估计与控制参考点统一，避免前轴/质心
+     模型混用带来的额外建模误差（Stanley 是以前轴中心为参考点的自行车模型）
+
+2. 参考航向插值bug修正
+
+   - `map_load/math_utils.py` 新增角度圆插值 `interpolate_angle`、`interp_angle_1d`：
+     修复 [-π,π] 表示下线性插值在 ±π 边界穿零的问题。规划侧
+     `vehicle_perception._interpolate_path_point_at_s`、控制侧轨迹 θ 插值、
+     Stanley （保留模块）均已改用圆插值
+
+3. scenario_set 新增 cut-in 场景，使用方法见 README.md
+
+TODO:
+1. 见version 2.5
+2. code clean

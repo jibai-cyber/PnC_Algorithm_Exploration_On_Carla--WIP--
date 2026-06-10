@@ -1,12 +1,14 @@
 {
-  "stanley": {
-    "k": 0.7,
-    "epsilon": 0.3,
+  "lqr": {
+    "q_x": 100.0,
+    "q_y": 100.0,
+    "q_theta": 10.0,
+    "r_v": 1.0,
+    "r_delta": 50.0,
     "max_steer": 1.22,
-    "filter_alpha": 0.2,
-    "lookahead_base": 1.5,
-    "lookahead_gain": 0.5,
-    "curvature_feedforward_gain": 0.0
+    "lr_ratio": 0.5,
+    "v_r_floor": 0.15,
+    "curvature_dt": 0.05
   },
   "speed_controller": {
     "kp": 2.0,
