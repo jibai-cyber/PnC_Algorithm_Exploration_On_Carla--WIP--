@@ -1,5 +1,5 @@
 # Intro
-See updated_version.txt  
+See **SYSTEM_ARCHITECTURE.md** for system architecture details and **updated_version.txt** for version update instructions.  
 
 # Ref
 > https://github.com/gezp/carla_ros/releases/  
@@ -9,7 +9,7 @@ See updated_version.txt
 > https://github.com/ApolloAuto/apollo/  
 
 # Necessary revision of carla-ros-bridge
-See REAL_TIME_FACTOR_CHANGES.md and updated_version.txt(version 2.3)  
+See **REAL_TIME_FACTOR_CHANGES.md** and **updated_version.txt**(version 2.3)  
 
 # Current effect
 https://github.com/user-attachments/assets/95dcb773-babf-4f57-a353-a40c0356a24b  
@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/95dcb773-babf-4f57-a353-a40c0356a24b
 ---
 # Quick start
 
-## In vehicle_ctrl/vehicle_ctrl/carla_vehicle_control.py
+## In control/controller/carla_vehicle_control.py
 ```python
 def _init_carla_connection(self):
     # Subsititude your own IP Address here
@@ -55,24 +55,24 @@ source ~/carla-ros-bridge/catkin_ws/install/setup.bash
 ```
 ### Config of carla is modifiable in _objects.json_
 ```bash
-ros2 launch carla_spawn_objects carla_example_ego_vehicle.launch.py spawn_sensors_only:=False objects_definition_file:=/home/usr/ws/src/vehicle_ctrl/config/objects.json 
+ros2 launch carla_spawn_objects carla_example_ego_vehicle.launch.py spawn_sensors_only:=False objects_definition_file:=/home/usr/ws/src/control/config/objects.json 
 ```
 
 ## Terminal 4, load map
 ```bash
 source ~/ws/install/setup.bash 
-ros2 run map_load map_control_node 
+ros2 run planning global_path_planner_node 
 ```
 
 ## Terminal 5, remap goal
 ```bash
 source ~/ws/install/setup.bash 
-ros2 run vehicle_ctrl remap_goal
+ros2 run control remap_goal
 ```
 
 ## Terminal 6, open rviz
 ```bash
-rviz2 -d src/vehicle_ctrl/rviz2/carla_map_spawn_anywherev2.rviz 
+rviz2 -d src/control/rviz2/carla_map_spawn_anywherev2.rviz 
 ```
 ```json
 // To view the camera feed in Carla, click the 'Image' button on the left sidebar of rviz
@@ -90,17 +90,17 @@ rviz2 -d src/vehicle_ctrl/rviz2/carla_map_spawn_anywherev2.rviz
 }
 ```
 
-## Terminal 7, open control/smooth/perception node
+## Terminal 7, launch PnC nodes
 ```bash
 source ~/ws/install/setup.bash 
 source ~/carla-ros-bridge/catkin_ws/install/setup.bash
-ros2 launch vehicle_ctrl full_system.launch.py
+ros2 launch control full_system.launch.py
 ```
 
 ## Terminal 8, open the plotter
 ```bash
 source ~/ws/install/setup.bash 
-ros2 run vehicle_ctrl vehicle_plotter
+ros2 run control ego_state_plotter
 ```
 
 ## Terminal 9, run scenario

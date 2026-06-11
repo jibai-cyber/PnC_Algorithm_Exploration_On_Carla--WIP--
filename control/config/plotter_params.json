@@ -1,0 +1,5 @@
+{
+  "plot_update_rate": 10.0,
+  "error_history_size": 500,
+  "enable_plotting": true
+}

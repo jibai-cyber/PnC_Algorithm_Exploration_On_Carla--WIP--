@@ -1,0 +1,191 @@
+"""Load planning package JSON configs with lru_cache (one parse per process)."""
+
+from __future__ import annotations
+
+import copy
+import functools
+import json
+import os
+from typing import Any
+
+_CONFIG_FILENAME = 'planning_params.json'
+
+
+def default_planning_params() -> dict[str, Any]:
+    return {
+        'global_path_planner': {
+            'path_resolution': 1.0,
+            'waypoint_display_interval': 4,
+            'connection_threshold': 5.0,
+            'astar_max_iterations': 500,
+            'centerline_warn_distance': 5.0,
+            'stop_speed_threshold_ms': 0.05,
+            'stop_duration_sec': 0.1,
+            'k_zeroval': 1e-4,
+        },
+        'ref_line_smoother': {
+            'smooth_w1': 0.3,
+            'smooth_w2': 1.0,
+            'smooth_w3': 0.1,
+            'smooth_deviation_limit': 0.5,
+            'point_spacing': 1.0,
+            'look_forward_time_sec': 8.0,
+            'look_forward_short_distance': 180.0,
+            'look_backward_distance': 50.0,
+            'default_forward_distance': 150.0,
+            'smooth_interval': 0.1,
+            'overlap_length_ratio': 0.5,
+        },
+        'planning_base': {
+            'control_dt': 0.05,
+            'point_spacing': 1.0,
+            'reference_line_horizon': 50.0,
+            'backward_distance': 30.0,
+            'road_width_total': 8.0,
+            'road_left_boundary_l_ego': 2.0,
+            'road_left_boundary_l_full': 6.0,
+            'road_right_boundary_l': -2.0,
+            'borrow_s_pad_front': 10.0,
+            'borrow_s_pad_rear': 5.0,
+            'obs_static_speed_thresh_mps': 0.1,
+            'path_boundary_s_resolution': 0.5,
+            'judge_distance_before_stop_line': 1.0,
+            'ego_lat_buffer': 0.3,
+            'ego_width_default': 1.8,
+            'block_stop_distance': 10.0,
+            'planning_speed_profile_resample_dt_s': 0.1,
+            'planning_speed_profile_t_horizon_s': 5.0,
+            'planning_obstacle_t_horizon_s': 5.0,
+            'vehicle_length': 4.5,
+            'vehicle_length_fallback': 3.0,
+            'vehicle_wheelbase': 2.8,
+            'vehicle_max_steering_angle': 0.6,
+            'reuse_max_time': 2.0,
+            'reuse_max_l_dev': 0.5,
+            'reuse_obs_xy_tol': 0.6,
+            'reuse_max_ego_s_jump': 5.0,
+            'max_steering_rate': 0.5,
+            'kappa_max_safe': 1.0,
+        },
+        'local_path_planner': {
+            'init_tol_l': 0.05,
+            'init_tol_dl': 0.02,
+            'init_tol_ddl': 0.06,
+            'w_ref': 0.3,
+            'w_dl': 0.1,
+            'w_ddl': 0.1,
+            'w_dddl': 0.01,
+            'w_end_l': 1.0,
+            'w_end_dl': 0.1,
+            'w_end_ddl': 0.01,
+        },
+        'speed_planner': {
+            'default_v': 2.5,
+            'ego_speed_dt': 0.1,
+            'ego_speed_t': 5.0,
+            'obs_sample_dt': 0.25,
+            'dp_st_graph_dt': 0.5,
+            'st_t_horizon': 5.0,
+            'stop_line_offset_back_m': 5.0,
+            'stop_line_hold_empty_streak': 10,
+            'ego_half_width': 0.6,
+            'ego_lat_buffer': 0.3,
+            'sensor_threshold_dv': 1.0,
+            'sensor_threshold_da': 1.0,
+            'obs_static_speed_thresh_mps': 0.1,
+        },
+        'st_dp': {
+            'w_exceed': 20.0,
+            'w_lower_speed': 0.0,
+            'w_ref': 0.7,
+            'w_acc': 0.5,
+            'w_dacc': 0.25,
+            'w_jerk': 0.1,
+            'w_soft_obs': 1.0,
+            'd0_soft_m': 1.5,
+            'max_accel': 2.0,
+            'a_cost_min': -4.0,
+            'a_cost_max': 2.0,
+            'v_max_prune': 10.0,
+            'w_progress': 0.35,
+            'dense_s_points': 100,
+            'dense_ds': 0.1,
+            'sparse_ds': 1.0,
+            'w_avg': 0.0,
+        },
+        'st_qp': {
+            'w_s': 0.5,
+            'w_v': 0.5,
+            'w_a': 0.4,
+            'w_j': 0.32,
+            'v_abs_max': 10.0,
+            'a_min': -4.0,
+            'a_max': 2.0,
+            'j_min': -4.0,
+            'j_max': 4.0,
+            'init_tol_s': 1e-6,
+            'init_tol_v': 1e-6,
+            'init_tol_a': 1e-6,
+        },
+    }
+
+
+def _colcon_workspace_src_config_path() -> str | None:
+    try:
+        from ament_index_python.packages import get_package_prefix
+        prefix = get_package_prefix('planning')
+        install_root = os.path.dirname(prefix)
+        ws = os.path.dirname(install_root)
+        return os.path.join(ws, 'src', 'planning', 'config', _CONFIG_FILENAME)
+    except Exception:
+        return None
+
+
+def _config_search_paths() -> list[str]:
+    paths: list[str] = []
+    override = os.environ.get('PLANNING_PARAMS')
+    if override:
+        paths.append(os.path.expanduser(override.strip()))
+    module_dir = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    paths.append(os.path.normpath(os.path.join(module_dir, '..', 'config', _CONFIG_FILENAME)))
+    ws_src = _colcon_workspace_src_config_path()
+    if ws_src:
+        paths.append(os.path.normpath(ws_src))
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory('planning')
+        paths.append(os.path.join(share, 'config', _CONFIG_FILENAME))
+    except Exception:
+        pass
+    return paths
+
+
+def _merge_params(defaults: dict, raw: dict) -> dict:
+    cfg = copy.deepcopy(defaults)
+    for key, val in raw.items():
+        if key in cfg and isinstance(cfg[key], dict) and isinstance(val, dict):
+            cfg[key].update(val)
+        elif key in cfg:
+            cfg[key] = val
+    return cfg
+
+
+@functools.lru_cache(maxsize=1)
+def load_planning_params() -> dict[str, Any]:
+    defaults = default_planning_params()
+    for path in _config_search_paths():
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                raise ValueError('root must be a JSON object')
+            return _merge_params(defaults, raw)
+        except Exception:
+            continue
+    return copy.deepcopy(defaults)
+
+
+def planning_section(name: str) -> dict[str, Any]:
+    return load_planning_params()[name]

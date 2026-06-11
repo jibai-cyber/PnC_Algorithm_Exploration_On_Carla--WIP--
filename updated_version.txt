@@ -62,14 +62,14 @@ version 1.3.1
 ---
 version 1.4
 1. 优化代码结构
-vehicle_ctrl/vehicle_ctrl/
+control/controller/
 ├── __init__.py
 ├── constants.py              # 常量定义
 ├── stanley_controller.py     # Stanley控制器
 ├── pid_controller.py        # PID控制器
 ├── bicycle_model_ekf.py     # EKF滤波器
 ├── carla_vehicle_control.py # 主控制节点
-└── simple_ctrl.py          # 主入口（仅main函数）
+└── control_base.py          # 主入口（仅main函数）
 
 TODO:
 1. 完善路径平滑和速度规划
@@ -83,7 +83,7 @@ version 2.0
    并根据重叠区域进行拓展，减小直接计算整段路径的算力开销
 2. 稀疏采样点间隔，防止过度拟合原始轨迹，减弱平滑效果
 3. 优化采样点逻辑，修复lanelet间采样点缺失问题
-4. 优化map_control.py的冗余逻辑和算力开销
+4. 优化global_path_planner.py的冗余逻辑和算力开销
 5. 改进stanley相关参数，优化转弯时横向跟踪效果
 6. objects.json添加部分摄像头配置
 
@@ -93,7 +93,7 @@ TODO:
 2. U-turn优化后虽平滑，但仍不满足车辆最小转弯半径。
    后续考虑增加曲率等非线性约束
 3. 完善速度规划和障碍物信息订阅等内容
-4. 优化map_control.py代码架构
+4. 优化global_path_planner.py代码架构
 5. 添加先前实现效果的记录和原理实现详解
 
 
@@ -103,7 +103,7 @@ version 2.1
    - 创建静态障碍物并获取BoundingBox
    - 将自车坐标和障碍物box投影至frenet坐标系
    - 可视化s-l图，便于观察后续生成的避障轨迹
-2. 精简map_control.py的冗余话题和调试
+2. 精简global_path_planner.py的冗余话题和调试
 
 TODO:
 1. 发现version1残留的一个问题：在U-turn时虽然轨迹已经平滑，但跟踪效果欠佳
@@ -136,10 +136,10 @@ version 2.2
 
    - 通过obs的绕行决策提取obs指定角点取代AABB法，obs边界贴合自身几何形状
 
-   - FrenetQPPlanner约束条件：分段 jerk QP，约束含边界、曲率、jerk、连续性、初始状态、ego 四角点。
+   - LocalPathPlanner约束条件：分段 jerk QP，约束含边界、曲率、jerk、连续性、初始状态、ego 四角点。
      其中ego角点约束用的是收缩前的PathBoudary，防止约束过于严苛
 
-   - carla_vehicle_control逻辑优化（原先逻辑为跟踪 path_smoother 平滑后的参考线）：
+   - carla_vehicle_control逻辑优化（原先逻辑为跟踪 ref_line_smoother 平滑后的参考线）：
      优先跟踪 QP 局部路径，参考线仅作为坐标转换的参考系和最次解；
      采用双索引（ref_nearest_idx / traj_nearest_idx）将局部路径与参考线解耦
 
@@ -157,7 +157,7 @@ version 2.2
 
    - 修正错画PathBoundary的逻辑
 
-   - vehicle_plotter：s-l 图绘制 PathBoundary 与 QP 路径
+   - ego_state_plotter：s-l 图绘制 PathBoundary 与 QP 路径
 
    
 
@@ -175,7 +175,7 @@ TODO:
 6. 改进 QP 的cost函数，使得其尽可能的贴着凸空间的中心线行驶（当前设计是使其尽可能贴近参考线，
    导致当obs侵入参考线时，规划的轨迹都是贴合obs边界的），提升规划路径的安全性
 7. (optional) 增强 PathBoundary 的复用率。
-8. 降低 vehicle_perception.py 代码的圈复杂度，增强可读性
+8. 降低 planning_base.py 代码的圈复杂度，增强可读性
 
 
 ---
@@ -244,7 +244,7 @@ version 2.3
      分析后发现其仅使用于部分场景（如obs垂直于参考线切入或只有一个角点位于新矩形内），结果极具局限性。
      我们常希望能尽快用已知的知识体系去转化和解决问题，但遇到素为谋面的问题时，这往往是最大的局限所在
 
-   - 定义新消息类型，见map_load/msg。将 Path 和 SpeedProfile 对齐得到 Trajectory， 
+   - 定义新消息类型，见planning/msg。将 Path 和 SpeedProfile 对齐得到 Trajectory， 
      Trajectory 替代原本的 Path 发布至控制器。便于后续路径和速度的解偶规划
 
    - 新参考线路径可能存在较大曲率；obs四个角点各自投到参考线得到相应坐标后，
@@ -267,7 +267,7 @@ version 2.3
 
 8. 修复ego在静态obs后方启动异常的bug
 
-9. map_control.py: 解决起始部分路径可能会出现往ego后方“折返”的bug
+9. global_path_planner.py: 解决起始部分路径可能会出现往ego后方“折返”的bug
 
 10. 在静态obs后划 stop_line 供速度规划，这样就不必在 speed_planner 中针对
     不同决策的静态obs进行区分，且每次遇到静态obs，可以先停在 stop_line，判断其
@@ -290,7 +290,7 @@ TODO:
 3. 添加速度规划的非线性曲率约束(optional)
 4. 对于静态障碍物的边界可以采用扫描线算法，结合决策求出边，增强泛化能力(optional)
 5. 完成对obs的轨迹预测，实现完整速度规划
-6. 当前感知部分和路径规划部分都写在了一个节点map_load/vehicle_perception.py，后期需要拆解成两个独立节点
+6. 当前感知部分和路径规划部分都写在了一个节点planning/modified_EM_planner/planning_base.py，后期需要拆解成两个独立节点
 7. 发现部分lanelet中心线的点会丢失，少部分终点可能会规划到下一个lanelet的起点附近（rviz中显示的路径越过goal_pose箭头）
    当前仍能停在终点是因为强行插入了goal_pose
    起点在丢失的lanelet上导致的路径丢失问题已通过插值和点乘判断解决。此问题需要尽快协调负责画osm地图的同学解决
@@ -399,7 +399,7 @@ version 2.5
    以 REP-145 与 carla-ros-bridge 实际输出为准做一次性标定验证。
    为简化配置，决定进行如上更改。
 
-4. vehicle_perception.py不再把 Frenet 横向 QP 整段几何路径当作 “执行路径” 发到旧话题；
+4. planning_base.py不再把 Frenet 横向 QP 整段几何路径当作 “执行路径” 发到旧话题；
    改为在速度剖面投影到局部路径后，与 EgoPlanningTrajectory 同源发布
    `/planning/ego_trajectory_path`（nav_msgs/Path），Rviz 显示的是 5s 内真实时空轨迹
 
@@ -436,7 +436,7 @@ version 2.6
      LQR 的 v_cmd 作为速度 PID 期望。配置项由 stanley 段改为 lqr 段（见
      config/carla_control_params.json）
 
-   - 公式与推导见 `vehicle_ctrl/docs/cg_lqr_controller.md`
+   - 公式与推导见 `control/docs/cg_lqr_controller.md`
 
    为何 LQR 在大曲率弯道（尤其 U-turn）追踪优于 Stanley（原理简述）：
 
@@ -456,9 +456,9 @@ version 2.6
 
 2. 参考航向插值bug修正
 
-   - `map_load/math_utils.py` 新增角度圆插值 `interpolate_angle`、`interp_angle_1d`：
+   - `planning/modified_EM_planner/math_utils.py` 新增角度圆插值 `interpolate_angle`、`interp_angle_1d`：
      修复 [-π,π] 表示下线性插值在 ±π 边界穿零的问题。规划侧
-     `vehicle_perception._interpolate_path_point_at_s`、控制侧轨迹 θ 插值、
+     `planning_base._interpolate_path_point_at_s`、控制侧轨迹 θ 插值、
      Stanley （保留模块）均已改用圆插值
 
 3. scenario_set 新增 cut-in 场景，使用方法见 README.md
