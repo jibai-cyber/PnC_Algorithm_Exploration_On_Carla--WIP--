@@ -1,5 +1,5 @@
 # Intro
-See **SYSTEM_ARCHITECTURE.md** for system architecture details and **updated_version.txt** for version update instructions.  
+See ![SYSTEM_ARCHITECTURE](./SYSTEM_ARCHITECTURE.md) for system architecture details and ![updated_version](./updated_version.txt) for version update instructions.  
 
 # Ref
 > https://github.com/gezp/carla_ros/releases/  
@@ -9,10 +9,12 @@ See **SYSTEM_ARCHITECTURE.md** for system architecture details and **updated_ver
 > https://github.com/ApolloAuto/apollo/  
 
 # Necessary revision of carla-ros-bridge
-See **REAL_TIME_FACTOR_CHANGES.md** and **updated_version.txt**(version 2.3)  
+See ![REAL_TIME_FACTOR_CHANGES](./REAL_TIME_FACTOR_CHANGES.md) and ![updated_version](./updated_version.txt)(version 2.3)  
 
 # Current effect
-https://github.com/user-attachments/assets/95dcb773-babf-4f57-a353-a40c0356a24b  
+https://github.com/user-attachments/assets/0af0423e-91c1-4c20-8fe9-a79784f51a90
+
+https://github.com/user-attachments/assets/6afcbec6-616f-4d61-9ac1-7a0383e07876
 
 | ![Debug_Diagram](pic/Debug_Diagram.png "Debug Diagram")  | 
 |:--:| 
@@ -23,7 +25,7 @@ https://github.com/user-attachments/assets/95dcb773-babf-4f57-a353-a40c0356a24b
 ---
 # Quick start
 
-## In control/controller/carla_vehicle_control.py
+## In ![carla_vehicle_control.py](./controller/carla_vehicle_control.py)
 ```python
 def _init_carla_connection(self):
     # Subsititude your own IP Address here
@@ -53,7 +55,7 @@ ros2 launch carla_ros_bridge carla_ros_bridge.launch.py synchronous_mode:=True t
 ```bash
 source ~/carla-ros-bridge/catkin_ws/install/setup.bash
 ```
-### Config of carla is modifiable in _objects.json_
+### Config of carla is modifiable in ![objects.json](./config/objects.json)
 ```bash
 ros2 launch carla_spawn_objects carla_example_ego_vehicle.launch.py spawn_sensors_only:=False objects_definition_file:=/home/usr/ws/src/control/config/objects.json 
 ```
